@@ -19,9 +19,21 @@ def _truthy(name: str, default: str = "false") -> bool:
 
 
 def normalize_title(title: str) -> str:
-    text = title.lower()
+    """Normalize titles so Bindery duplicate folders still match.
+
+    Bindery often creates:
+      The Temporal Void (2008)/          <- ebook
+      The Temporal Void (2008) (2)/      <- audiobook
+    Storyteller then imports them as separate books with those titles.
+    """
+    text = title.lower().strip()
+    # Drop year suffixes: (2008)
     text = re.sub(r"\s*\(\d{4}\)\s*", " ", text)
+    # Drop Bindery collision suffixes: (2), (3), …
+    text = re.sub(r"\s*\(\d{1,3}\)\s*", " ", text)
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    # Trailing lone duplicate index left after stripping punctuation
+    text = re.sub(r"\s+\d{1,3}$", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 

@@ -160,8 +160,9 @@ def convert(source: Path) -> None:
         if _storyteller.enabled:
             # Give Storyteller's auto-import a moment to see the new EPUB.
             time.sleep(float(os.environ.get("STORYTELLER_MERGE_DELAY", "15")))
+            # Strip Bindery "Title (2008)" / "Title (2008) (2)" folder noise
             title_guess = re.sub(
-                r"\s*\(\d{4}\)\s*$", "", source.parent.name
+                r"\s*\(\d{4}\)\s*(\(\d{1,3}\)\s*)?$", "", source.parent.name
             ).strip() or source.stem
             try:
                 if not _storyteller.try_merge_for_title(title_guess):

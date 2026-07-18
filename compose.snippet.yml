@@ -1,9 +1,17 @@
-# Paste into your media-PC compose (same stack as bindery/storyteller).
-# Builds from GitHub until a prebuilt GHCR image is available.
+# Windows Docker Compose cannot build from a GitHub URL context.
+# Clone once next to your compose file, then build from the local folder:
+#
+#   cd "M:\Docker Compose Files\Core"
+#   git clone https://github.com/Plumptons/azw3-to-epub.git
+#
+# Put secrets in that folder's .env:
+#   BINDERY_API_KEY=...
+#   STORYTELLER_USERNAME=...
+#   STORYTELLER_PASSWORD=...
 
   azw3-to-epub:
     build:
-      context: https://github.com/Plumptons/azw3-to-epub.git#main:azw3-to-epub
+      context: ./azw3-to-epub/azw3-to-epub
     image: azw3-to-epub:latest
     container_name: azw3-to-epub
     user: "0:0"

@@ -1,0 +1,23 @@
+# Paste this service into your media-PC compose (same stack as bindery/storyteller).
+
+  azw3-to-epub:
+    image: ghcr.io/plumptons/azw3-to-epub:latest
+    container_name: azw3-to-epub
+    user: "0:0"
+    restart: unless-stopped
+    environment:
+      TZ: Pacific/Auckland
+      LIBRARY_DIR: /media/books
+      DELETE_SOURCE: "false"
+      INITIAL_SCAN: "true"
+      BINDERY_URL: http://bindery:8787
+      BINDERY_API_KEY: ${BINDERY_API_KEY}
+      BINDERY_SYNC: "true"
+      BINDERY_LIBRARY_DIR: /media/books
+      STORYTELLER_URL: http://storyteller:8001
+      STORYTELLER_USERNAME: ${STORYTELLER_USERNAME}
+      STORYTELLER_PASSWORD: ${STORYTELLER_PASSWORD}
+      STORYTELLER_AUTO_MERGE: "true"
+      STORYTELLER_MERGE_INTERVAL: "300"
+    volumes:
+      - M:/media:/media

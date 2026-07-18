@@ -1,0 +1,40 @@
+# Drop-in AZW3 → EPUB converter for the media PC that already runs Bindery + Storyteller.
+#
+# Best: paste this service into the same compose as bindery/storyteller so
+# BINDERY_URL=http://bindery:8787 and STORYTELLER_URL=http://storyteller:8001 resolve.
+#
+# Paths mirror your Bindery service:
+#   BINDERY_LIBRARY_DIR=/media/books
+#   volumes: M:/media:/media
+#
+# Tip: point Storyteller's auto-import folder at /media/books so new ebook+audio
+# pairs in the same Bindery folder are matched on import (API merge covers orphans).
+
+services:
+  azw3-to-epub:
+    build:
+      context: ./azw3-to-epub
+      dockerfile: Dockerfile
+    image: azw3-to-epub:local
+    container_name: azw3-to-epub
+    user: "${PUID:-0}:${PGID:-0}"
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Pacific/Auckland}
+      LIBRARY_DIR: /media/books
+      DELETE_SOURCE: ${DELETE_SOURCE:-false}
+      INITIAL_SCAN: ${INITIAL_SCAN:-true}
+      STABLE_SECONDS: ${STABLE_SECONDS:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BINDERY_URL: ${BINDERY_URL:-http://bindery:8787}
+      BINDERY_API_KEY: ${BINDERY_API_KEY:-}
+      BINDERY_SYNC: ${BINDERY_SYNC:-true}
+      BINDERY_LIBRARY_DIR: ${BINDERY_LIBRARY_DIR:-/media/books}
+      STORYTELLER_URL: ${STORYTELLER_URL:-http://storyteller:8001}
+      STORYTELLER_USERNAME: ${STORYTELLER_USERNAME:-}
+      STORYTELLER_PASSWORD: ${STORYTELLER_PASSWORD:-}
+      STORYTELLER_AUTO_MERGE: ${STORYTELLER_AUTO_MERGE:-true}
+      STORYTELLER_MERGE_INTERVAL: ${STORYTELLER_MERGE_INTERVAL:-300}
+      STORYTELLER_MERGE_DELAY: ${STORYTELLER_MERGE_DELAY:-15}
+    volumes:
+      - ${MEDIA_DIR:?Set MEDIA_DIR in .env}:/media

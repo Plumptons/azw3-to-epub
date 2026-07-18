@@ -78,6 +78,51 @@ class BinderyClient:
             raise RuntimeError(f"unexpected book payload for id={book_id}")
         return book
 
+    def list_wanted(self) -> list[dict[str, Any]]:
+        """Return Wanted/missing books (Bindery GET /wanted/missing)."""
+        payload = self._request("GET", "/wanted/missing", timeout=120)
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            items = payload.get("items") or payload.get("books") or []
+            return items if isinstance(items, list) else []
+        return []
+
+    def search_wanted(self, book_ids: list[int], chunk_size: int = 100) -> int:
+        """Trigger Bindery search+auto-grab for wanted book IDs (POST /wanted/bulk)."""
+        if not book_ids:
+            return 0
+        queued = 0
+        for i in range(0, len(book_ids), chunk_size):
+            chunk = book_ids[i : i + chunk_size]
+            self._request(
+                "POST",
+                "/wanted/bulk",
+                {"ids": chunk, "action": "search"},
+                timeout=120,
+            )
+            queued += len(chunk)
+            log.info("Queued Bindery wanted search for %s book(s)", len(chunk))
+        return queued
+
+    def search_all_wanted(self) -> int:
+        """List every Wanted book and fire Bindery's search+grab for each."""
+        if not self.enabled:
+            return 0
+        wanted = self.list_wanted()
+        ids: list[int] = []
+        for book in wanted:
+            book_id = book.get("id")
+            if isinstance(book_id, int):
+                ids.append(book_id)
+            elif isinstance(book_id, str) and book_id.isdigit():
+                ids.append(int(book_id))
+        if not ids:
+            log.info("Bindery wanted search: no missing books")
+            return 0
+        log.info("Bindery wanted search: triggering search+grab for %s book(s)", len(ids))
+        return self.search_wanted(ids)
+
     def list_books(self, search: str, limit: int = 50) -> list[dict[str, Any]]:
         qs = urllib.parse.urlencode({"search": search, "limit": str(limit), "offset": "0"})
         page = self._request("GET", f"/book?{qs}")

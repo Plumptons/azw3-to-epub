@@ -27,6 +27,13 @@ POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
 RECURSIVE = os.environ.get("RECURSIVE", "true").lower() in {"1", "true", "yes"}
 # How often to sweep Storyteller for ebook/audiobook pairs (0 = only after converts)
 STORYTELLER_MERGE_INTERVAL = float(os.environ.get("STORYTELLER_MERGE_INTERVAL", "300"))
+# How often to ask Bindery to search+grab Wanted books (Bindery's own loop is ~12h)
+BINDERY_SEARCH_INTERVAL = float(os.environ.get("BINDERY_SEARCH_INTERVAL", "3600"))
+BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 SOURCE_SUFFIXES = {".azw", ".azw3"}
 # Calibre defaults to EPUB 2; Storyteller prefers EPUB 3 (2 still works with a warning).
 EPUB_VERSION = os.environ.get("EPUB_VERSION", "3").strip() or "3"
@@ -212,6 +219,20 @@ def storyteller_merge_loop() -> None:
         time.sleep(STORYTELLER_MERGE_INTERVAL)
 
 
+def bindery_wanted_search_loop() -> None:
+    """Periodically trigger Bindery Wanted search+grab (default every hour)."""
+    if not (_bindery.enabled and BINDERY_WANTED_SEARCH and BINDERY_SEARCH_INTERVAL > 0):
+        return
+    # Short delay so Bindery is up after stack restart; then run immediately.
+    time.sleep(60)
+    while True:
+        try:
+            _bindery.search_all_wanted()
+        except Exception:
+            log.exception("Bindery wanted search failed")
+        time.sleep(BINDERY_SEARCH_INTERVAL)
+
+
 class Handler(FileSystemEventHandler):
     def on_created(self, event):  # type: ignore[no-untyped-def]
         if event.is_directory:
@@ -269,6 +290,16 @@ def main() -> None:
         target=storyteller_merge_loop, name="storyteller-merge", daemon=True
     )
     merge_worker.start()
+
+    search_worker = threading.Thread(
+        target=bindery_wanted_search_loop, name="bindery-wanted-search", daemon=True
+    )
+    search_worker.start()
+    if _bindery.enabled and BINDERY_WANTED_SEARCH:
+        log.info(
+            "Bindery wanted search enabled (every %ss)",
+            int(BINDERY_SEARCH_INTERVAL),
+        )
 
     if INITIAL_SCAN:
         initial_scan()

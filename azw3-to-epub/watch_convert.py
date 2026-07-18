@@ -116,7 +116,8 @@ def convert(source: Path) -> None:
             return
 
         target = epub_path_for(source)
-        tmp = target.with_suffix(".epub.partial")
+        # Must end in .epub — Calibre picks the output plugin from the extension.
+        tmp = target.with_name(f".{target.stem}.converting.epub")
         if tmp.exists():
             tmp.unlink()
 

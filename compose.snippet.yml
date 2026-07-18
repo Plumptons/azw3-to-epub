@@ -30,5 +30,6 @@
       STORYTELLER_PASSWORD: ${STORYTELLER_PASSWORD}
       STORYTELLER_AUTO_MERGE: "true"
       STORYTELLER_MERGE_INTERVAL: "300"
+      EPUB_VERSION: "3"
     volumes:
       - M:/media:/media

@@ -28,6 +28,8 @@ RECURSIVE = os.environ.get("RECURSIVE", "true").lower() in {"1", "true", "yes"}
 # How often to sweep Storyteller for ebook/audiobook pairs (0 = only after converts)
 STORYTELLER_MERGE_INTERVAL = float(os.environ.get("STORYTELLER_MERGE_INTERVAL", "300"))
 SOURCE_SUFFIXES = {".azw", ".azw3"}
+# Calibre defaults to EPUB 2; Storyteller prefers EPUB 3 (2 still works with a warning).
+EPUB_VERSION = os.environ.get("EPUB_VERSION", "3").strip() or "3"
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -121,9 +123,10 @@ def convert(source: Path) -> None:
         if tmp.exists():
             tmp.unlink()
 
-        log.info("Converting %s -> %s", source, target)
+        log.info("Converting %s -> %s (epub %s)", source, target, EPUB_VERSION)
+        cmd = [EBOOK_CONVERT, str(source), str(tmp), "--epub-version", EPUB_VERSION]
         result = subprocess.run(
-            [EBOOK_CONVERT, str(source), str(tmp)],
+            cmd,
             capture_output=True,
             text=True,
             check=False,

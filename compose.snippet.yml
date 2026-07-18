@@ -1,7 +1,10 @@
-# Paste this service into your media-PC compose (same stack as bindery/storyteller).
+# Paste into your media-PC compose (same stack as bindery/storyteller).
+# Builds from GitHub until a prebuilt GHCR image is available.
 
   azw3-to-epub:
-    image: ghcr.io/plumptons/azw3-to-epub:latest
+    build:
+      context: https://github.com/Plumptons/azw3-to-epub.git#main:azw3-to-epub
+    image: azw3-to-epub:latest
     container_name: azw3-to-epub
     user: "0:0"
     restart: unless-stopped

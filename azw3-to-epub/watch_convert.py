@@ -251,6 +251,9 @@ def main() -> None:
     )
     if _bindery.enabled:
         log.info("Bindery API: %s", _bindery.base_url)
+        fixed = _bindery.cleanup_all_parked_epubs()
+        if fixed:
+            log.info("Cleaned %s parked EPUB leftover(s) from prior runs", fixed)
     if _storyteller.enabled:
         log.info("Storyteller API: %s", _storyteller.base_url)
     log.info("Using %s", EBOOK_CONVERT)

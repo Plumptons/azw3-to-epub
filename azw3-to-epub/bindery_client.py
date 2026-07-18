@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +16,7 @@ from typing import Any
 log = logging.getLogger("azw3-to-epub.bindery")
 
 TEMP_STEM_SUFFIX = ".__st_epub__"
+PARKED_MARKER = f"{TEMP_STEM_SUFFIX}.epub"
 
 
 def _truthy(name: str, default: str = "false") -> bool:
@@ -180,13 +182,79 @@ class BinderyClient:
                     return book_id
         return None
 
+    def _ebook_paths(self, book: dict[str, Any]) -> list[str]:
+        paths: list[str] = []
+        for key in ("ebookFilePath", "filePath"):
+            value = book.get(key)
+            if value:
+                paths.append(str(value))
+        for entry in book.get("bookFiles") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("format") in (None, "ebook") and entry.get("path"):
+                paths.append(str(entry["path"]))
+        return paths
+
+    def _wait_for_non_parked_ebook(self, book_id: int, timeout: float = 90) -> str | None:
+        """Return Bindery's ebook path once it no longer points at our parked file."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                book = self.get_book(book_id)
+            except Exception:
+                log.debug("Poll book %s failed", book_id, exc_info=True)
+                time.sleep(2)
+                continue
+            for path in self._ebook_paths(book):
+                if path and PARKED_MARKER not in path.replace("\\", "/").lower():
+                    if path.lower().endswith(".epub"):
+                        return path
+            time.sleep(2)
+        return None
+
+    @staticmethod
+    def cleanup_parked_epubs(folder: Path, final_epub: Path | None = None) -> None:
+        """Remove *__st_epub__.epub leftovers so Storyteller sees one ebook."""
+        if not folder.is_dir():
+            return
+        for path in folder.glob(f"*{TEMP_STEM_SUFFIX}.epub"):
+            try:
+                path.unlink(missing_ok=True)
+                log.info("Removed parked EPUB leftover %s", path)
+            except OSError:
+                log.warning("Could not remove parked EPUB %s", path, exc_info=True)
+        # If Bindery never produced a final name, restore a normal .epub from parked.
+        if final_epub and not final_epub.exists():
+            parked = final_epub.with_name(f"{final_epub.stem}{TEMP_STEM_SUFFIX}.epub")
+            if parked.exists():
+                parked.rename(final_epub)
+                log.info("Restored parked EPUB to %s", final_epub)
+
+    def cleanup_all_parked_epubs(self) -> int:
+        """One-shot sweep for Storyteller-blocking duplicate parked EPUBs."""
+        fixed = 0
+        for path in self.library_dir.rglob(f"*{TEMP_STEM_SUFFIX}.epub"):
+            final = path.with_name(path.name.replace(TEMP_STEM_SUFFIX, ""))
+            try:
+                if final.exists():
+                    path.unlink(missing_ok=True)
+                    log.info("Removed parked EPUB leftover %s", path)
+                else:
+                    path.rename(final)
+                    log.info("Renamed orphan parked EPUB to %s", final)
+                fixed += 1
+            except OSError:
+                log.warning("Failed cleaning parked EPUB %s", path, exc_info=True)
+        return fixed
+
     def replace_azw3_with_epub(self, source: Path, epub: Path) -> bool:
         """
         Clear Bindery's ebook link for the AZW3 and re-import the EPUB.
 
         Bindery's DELETE /book/{id}/file?format=ebook stem-sweeps sibling
         ebook files that share the same basename, so the EPUB is briefly
-        renamed before the delete, then re-imported.
+        renamed before the delete, then re-imported. Parked leftovers are
+        removed afterward so Storyteller does not see two EPUBs in one folder.
         """
         if not self.enabled:
             return False
@@ -234,5 +302,24 @@ class BinderyClient:
                 book_id,
             )
             raise
+
+        # Bindery often copies into a final .epub and leaves the parked file behind.
+        # Storyteller then skips the folder ("multiple epubs of the same kind").
+        final_path = self._wait_for_non_parked_ebook(book_id)
+        if final_path:
+            log.info("Bindery ebook path for book %s is now %s", book_id, final_path)
+        else:
+            log.warning(
+                "Timed out waiting for Bindery to finish importing book %s; "
+                "cleaning parked EPUB if a final .epub already exists",
+                book_id,
+            )
+
+        if epub.exists() or final_path:
+            self.cleanup_parked_epubs(epub.parent, final_epub=epub)
+        elif parked.exists():
+            # Import kept the parked name only — rename for Storyteller.
+            parked.rename(epub)
+            log.info("Renamed parked EPUB to final name %s", epub)
 
         return True

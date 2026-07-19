@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from bindery_client import BinderyClient
+from library_coalesce import coalesce_library
 from storyteller_client import StorytellerClient
 
 LIBRARY_DIR = Path(os.environ.get("LIBRARY_DIR", "/books"))
@@ -34,6 +35,22 @@ BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "true").lower() 
     "true",
     "yes",
 }
+# Probe ebook-only books for audiobook releases; keep both or revert to ebook
+BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+BINDERY_AUDIO_PROBE_INTERVAL = float(
+    os.environ.get("BINDERY_AUDIO_PROBE_INTERVAL", "3600")
+)
+# Merge Bindery "Title (Year) (2)" sibling folders into the primary title folder
+FOLDER_COALESCE = os.environ.get("FOLDER_COALESCE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+FOLDER_COALESCE_INTERVAL = float(os.environ.get("FOLDER_COALESCE_INTERVAL", "300"))
 SOURCE_SUFFIXES = {".azw", ".azw3"}
 # Calibre defaults to EPUB 2; Storyteller prefers EPUB 3 (2 still works with a warning).
 EPUB_VERSION = os.environ.get("EPUB_VERSION", "3").strip() or "3"
@@ -219,6 +236,25 @@ def storyteller_merge_loop() -> None:
         time.sleep(STORYTELLER_MERGE_INTERVAL)
 
 
+def folder_coalesce_loop() -> None:
+    """Periodically merge Bindery ``(2)`` sibling folders for Storyteller pairing."""
+    if not FOLDER_COALESCE or FOLDER_COALESCE_INTERVAL <= 0:
+        return
+    time.sleep(30)
+    while True:
+        try:
+            fixed = coalesce_library(LIBRARY_DIR)
+            if fixed and _bindery.enabled:
+                _bindery.trigger_library_scan()
+            if fixed and _storyteller.enabled:
+                # Same-folder pairs import on their own; merge covers any leftovers.
+                time.sleep(10)
+                _storyteller.merge_all_pairs()
+        except Exception:
+            log.exception("Folder coalesce sweep failed")
+        time.sleep(FOLDER_COALESCE_INTERVAL)
+
+
 def bindery_wanted_search_loop() -> None:
     """Periodically trigger Bindery Wanted search+grab (default every hour)."""
     if not (_bindery.enabled and BINDERY_WANTED_SEARCH and BINDERY_SEARCH_INTERVAL > 0):
@@ -231,6 +267,21 @@ def bindery_wanted_search_loop() -> None:
         except Exception:
             log.exception("Bindery wanted search failed")
         time.sleep(BINDERY_SEARCH_INTERVAL)
+
+
+def bindery_audio_probe_loop() -> None:
+    """Promote ebook-only books to both when audiobook releases exist."""
+    if not (
+        _bindery.enabled and BINDERY_AUDIO_PROBE and BINDERY_AUDIO_PROBE_INTERVAL > 0
+    ):
+        return
+    time.sleep(90)
+    while True:
+        try:
+            _bindery.probe_audiobooks_for_ebooks()
+        except Exception:
+            log.exception("Bindery audiobook probe failed")
+        time.sleep(BINDERY_AUDIO_PROBE_INTERVAL)
 
 
 class Handler(FileSystemEventHandler):
@@ -266,13 +317,15 @@ def main() -> None:
         sys.exit(1)
 
     log.info(
-        "Watching %s (recursive=%s delete_source=%s initial_scan=%s bindery_sync=%s storyteller_merge=%s)",
+        "Watching %s (recursive=%s delete_source=%s initial_scan=%s "
+        "bindery_sync=%s storyteller_merge=%s folder_coalesce=%s)",
         LIBRARY_DIR,
         RECURSIVE,
         DELETE_SOURCE,
         INITIAL_SCAN,
         _bindery.enabled,
         _storyteller.enabled,
+        FOLDER_COALESCE,
     )
     if _bindery.enabled:
         log.info("Bindery API: %s", _bindery.base_url)
@@ -291,6 +344,16 @@ def main() -> None:
     )
     merge_worker.start()
 
+    coalesce_worker = threading.Thread(
+        target=folder_coalesce_loop, name="folder-coalesce", daemon=True
+    )
+    coalesce_worker.start()
+    if FOLDER_COALESCE:
+        log.info(
+            "Folder coalesce enabled (every %ss)",
+            int(FOLDER_COALESCE_INTERVAL),
+        )
+
     search_worker = threading.Thread(
         target=bindery_wanted_search_loop, name="bindery-wanted-search", daemon=True
     )
@@ -301,8 +364,27 @@ def main() -> None:
             int(BINDERY_SEARCH_INTERVAL),
         )
 
+    audio_probe_worker = threading.Thread(
+        target=bindery_audio_probe_loop, name="bindery-audio-probe", daemon=True
+    )
+    audio_probe_worker.start()
+    if _bindery.enabled and BINDERY_AUDIO_PROBE:
+        log.info(
+            "Bindery audiobook probe enabled (every %ss)",
+            int(BINDERY_AUDIO_PROBE_INTERVAL),
+        )
+
     if INITIAL_SCAN:
         initial_scan()
+        # One-shot coalesce on startup so existing (2) folders don't wait
+        # for the first periodic sweep.
+        if FOLDER_COALESCE:
+            try:
+                fixed = coalesce_library(LIBRARY_DIR)
+                if fixed and _bindery.enabled:
+                    _bindery.trigger_library_scan()
+            except Exception:
+                log.exception("Startup folder coalesce failed")
 
     observer = Observer()
     observer.schedule(Handler(), str(LIBRARY_DIR), recursive=RECURSIVE)

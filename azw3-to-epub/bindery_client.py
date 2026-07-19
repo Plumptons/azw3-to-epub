@@ -78,6 +78,53 @@ class BinderyClient:
             raise RuntimeError(f"unexpected book payload for id={book_id}")
         return book
 
+    def update_book(self, book_id: int, **fields: Any) -> dict[str, Any]:
+        book = self._request("PUT", f"/book/{book_id}", fields)
+        if not isinstance(book, dict):
+            raise RuntimeError(f"unexpected book payload after PUT id={book_id}")
+        return book
+
+    def set_media_type(self, book_id: int, media_type: str) -> dict[str, Any]:
+        return self.update_book(book_id, mediaType=media_type)
+
+    def interactive_search(self, book_id: int) -> list[dict[str, Any]]:
+        """POST /book/{id}/search — returns release dicts (does not grab)."""
+        payload = self._request("POST", f"/book/{book_id}/search", {}, timeout=180)
+        if isinstance(payload, dict):
+            results = payload.get("results") or []
+            return results if isinstance(results, list) else []
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def list_all_books(self, page_size: int = 100) -> list[dict[str, Any]]:
+        """Page through the Bindery catalogue."""
+        items: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            qs = urllib.parse.urlencode(
+                {"limit": str(page_size), "offset": str(offset)}
+            )
+            page = self._request("GET", f"/book?{qs}", timeout=120)
+            batch: list[dict[str, Any]] = []
+            total = 0
+            if isinstance(page, dict):
+                raw = page.get("items") or page.get("books") or []
+                batch = raw if isinstance(raw, list) else []
+                total = int(page.get("total") or 0)
+            elif isinstance(page, list):
+                batch = page
+                total = offset + len(batch)
+            if not batch:
+                break
+            items.extend(b for b in batch if isinstance(b, dict))
+            offset += len(batch)
+            if total and offset >= total:
+                break
+            if len(batch) < page_size:
+                break
+        return items
+
     def list_wanted(self) -> list[dict[str, Any]]:
         """Return Wanted/missing books (Bindery GET /wanted/missing)."""
         payload = self._request("GET", "/wanted/missing", timeout=120)
@@ -123,6 +170,171 @@ class BinderyClient:
         log.info("Bindery wanted search: triggering search+grab for %s book(s)", len(ids))
         return self.search_wanted(ids)
 
+    def _probe_state_path(self) -> Path:
+        configured = os.environ.get("BINDERY_AUDIO_PROBE_STATE", "").strip()
+        if configured:
+            return Path(configured)
+        return Path("/tmp/azw3-bindery-audio-probe.json")
+
+    def _load_probe_state(self) -> dict[str, Any]:
+        path = self._probe_state_path()
+        try:
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            log.debug("Could not read audio-probe state %s", path, exc_info=True)
+        return {"probed": {}}
+
+    def _save_probe_state(self, state: dict[str, Any]) -> None:
+        path = self._probe_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception:
+            log.warning("Could not write audio-probe state %s", path, exc_info=True)
+
+    @staticmethod
+    def _has_ebook(book: dict[str, Any]) -> bool:
+        if book.get("ebookFilePath") or book.get("filePath"):
+            return True
+        for entry in book.get("bookFiles") or []:
+            if isinstance(entry, dict) and entry.get("format") in (None, "ebook"):
+                if entry.get("path"):
+                    return True
+        return False
+
+    @staticmethod
+    def _has_audiobook(book: dict[str, Any]) -> bool:
+        if book.get("audiobookFilePath"):
+            return True
+        for entry in book.get("bookFiles") or []:
+            if isinstance(entry, dict) and entry.get("format") == "audiobook":
+                if entry.get("path"):
+                    return True
+        return False
+
+    def probe_audiobooks_for_ebooks(self) -> dict[str, int]:
+        """Promote ebook-only books to ``both`` when indexers have audiobooks.
+
+        For each monitored ebook-without-audio book:
+        1. Set mediaType to ``both`` (Bindery marks missing audio as wanted)
+        2. Interactive-search; if Bindery's dual search is flaky, also probe as
+           ``audiobook`` so category filters actually hit audio indexers
+        3. Keep ``both`` + queue search+grab when audio releases exist
+        4. Otherwise revert to ``ebook``
+
+        Returns counts: candidates, promoted, reverted, skipped, errors.
+        """
+        stats = {
+            "candidates": 0,
+            "promoted": 0,
+            "reverted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+        if not self.enabled or not _truthy("BINDERY_AUDIO_PROBE", "true"):
+            return stats
+
+        limit = max(1, int(os.environ.get("BINDERY_AUDIO_PROBE_LIMIT", "5")))
+        cooldown = float(os.environ.get("BINDERY_AUDIO_PROBE_COOLDOWN", str(7 * 86400)))
+        now = time.time()
+        state = self._load_probe_state()
+        probed: dict[str, Any] = state.setdefault("probed", {})
+        if not isinstance(probed, dict):
+            probed = {}
+            state["probed"] = probed
+
+        books = self.list_all_books()
+        candidates: list[dict[str, Any]] = []
+        for book in books:
+            book_id = book.get("id")
+            if not isinstance(book_id, int):
+                continue
+            if not book.get("monitored"):
+                continue
+            media = (book.get("mediaType") or "ebook").lower()
+            if media != "ebook":
+                continue
+            if not self._has_ebook(book) or self._has_audiobook(book):
+                continue
+            last = probed.get(str(book_id))
+            if isinstance(last, (int, float)) and now - float(last) < cooldown:
+                stats["skipped"] += 1
+                continue
+            candidates.append(book)
+
+        stats["candidates"] = len(candidates)
+        if not candidates:
+            log.info("Bindery audio probe: no ebook-only candidates")
+            return stats
+
+        log.info(
+            "Bindery audio probe: %s candidate(s), processing up to %s",
+            len(candidates),
+            limit,
+        )
+
+        for book in candidates[:limit]:
+            book_id = int(book["id"])
+            title = book.get("title") or book_id
+            try:
+                self.set_media_type(book_id, "both")
+                results = self.interactive_search(book_id)
+                audio_hits = [
+                    r
+                    for r in results
+                    if isinstance(r, dict)
+                    and (r.get("mediaType") or "").lower() == "audiobook"
+                ]
+                # Bindery interactive search for mediaType=both often still
+                # queries ebook categories only — probe audiobook mode too.
+                if not audio_hits:
+                    self.set_media_type(book_id, "audiobook")
+                    audio_hits = [
+                        r
+                        for r in self.interactive_search(book_id)
+                        if isinstance(r, dict)
+                    ]
+
+                if audio_hits:
+                    self.set_media_type(book_id, "both")
+                    self.search_wanted([book_id])
+                    stats["promoted"] += 1
+                    log.info(
+                        "Audio available for %s (%s) — left as both (%s release(s))",
+                        title,
+                        book_id,
+                        len(audio_hits),
+                    )
+                else:
+                    self.set_media_type(book_id, "ebook")
+                    stats["reverted"] += 1
+                    log.info(
+                        "No audiobook releases for %s (%s) — reverted to ebook",
+                        title,
+                        book_id,
+                    )
+                probed[str(book_id)] = now
+            except Exception:
+                stats["errors"] += 1
+                log.exception("Audio probe failed for book %s (%s)", book_id, title)
+                try:
+                    self.set_media_type(book_id, "ebook")
+                except Exception:
+                    log.exception("Could not restore ebook mediaType for %s", book_id)
+
+        self._save_probe_state(state)
+        log.info(
+            "Bindery audio probe done: promoted=%s reverted=%s errors=%s skipped=%s",
+            stats["promoted"],
+            stats["reverted"],
+            stats["errors"],
+            stats["skipped"],
+        )
+        return stats
+
     def list_books(self, search: str, limit: int = 50) -> list[dict[str, Any]]:
         qs = urllib.parse.urlencode({"search": search, "limit": str(limit), "offset": "0"})
         page = self._request("GET", f"/book?{qs}")
@@ -142,6 +354,19 @@ class BinderyClient:
             "/queue/manual-import",
             {"path": path, "bookId": book_id, "format": "ebook"},
         )
+
+    def trigger_library_scan(self) -> bool:
+        """Ask Bindery to rescan the library (reconcile paths after folder moves)."""
+        if not self.enabled:
+            return False
+        try:
+            self._request("POST", "/library/scan", timeout=30)
+            log.info("Triggered Bindery library scan")
+            return True
+        except Exception:
+            # Older Bindery builds may use a different path; not fatal.
+            log.warning("Bindery library scan request failed", exc_info=True)
+            return False
 
     def book_paths(self, book: dict[str, Any]) -> list[str]:
         paths: list[str] = []

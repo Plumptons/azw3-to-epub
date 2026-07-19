@@ -25,7 +25,7 @@ COPY requirements.txt .
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY watch_convert.py bindery_client.py storyteller_client.py .
+COPY watch_convert.py bindery_client.py storyteller_client.py library_coalesce.py .
 
 ENV PATH="/opt/venv/bin:$PATH"
 

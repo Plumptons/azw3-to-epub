@@ -282,16 +282,11 @@ class StorytellerClient:
         )
         series = ebook.get("series") or audiobook.get("series") or []
 
+        # Keep update minimal — Storyteller often 500s after a successful merge
+        # while regenerating covers if we send a heavy metadata payload.
         body = {
             "update": {
                 "title": ebook.get("title") or audiobook.get("title"),
-                "language": ebook.get("language") or audiobook.get("language"),
-                "publicationDate": ebook.get("publicationDate")
-                or audiobook.get("publicationDate"),
-                "rating": ebook.get("rating")
-                if ebook.get("rating") is not None
-                else audiobook.get("rating"),
-                "description": ebook.get("description") or audiobook.get("description"),
             },
             "relations": {
                 "creators": creators,
@@ -302,7 +297,23 @@ class StorytellerClient:
             },
             "from": [ebook["uuid"], audiobook["uuid"]],
         }
-        merged = self._request("POST", "/api/v2/books/merge", body=body)
+        try:
+            merged = self._request("POST", "/api/v2/books/merge", body=body)
+        except RuntimeError as exc:
+            # Observed: merge commits, then cover rewrite throws 500.
+            if "HTTP 500" in str(exc):
+                primary = self._request("GET", f"/api/v2/books/{ebook['uuid']}")
+                if (
+                    isinstance(primary, dict)
+                    and primary.get("ebook")
+                    and primary.get("audiobook")
+                ):
+                    log.warning(
+                        "Storyteller returned 500 after merge, but %s now has both formats",
+                        primary.get("title"),
+                    )
+                    return primary
+            raise
         log.info(
             "Merged Storyteller books: %s + %s -> %s",
             ebook.get("title"),

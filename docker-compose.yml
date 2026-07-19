@@ -12,10 +12,11 @@
 
 services:
   azw3-to-epub:
+    # Prefer the published image; fall back to a local build when developing.
+    image: ${AZW3_IMAGE:-ghcr.io/plumptons/azw3-to-epub:latest}
     build:
       context: ./azw3-to-epub
       dockerfile: Dockerfile
-    image: azw3-to-epub:local
     container_name: azw3-to-epub
     user: "${PUID:-0}:${PGID:-0}"
     restart: unless-stopped

@@ -19,6 +19,7 @@
       LIBRARY_DIR: /media/books
       DELETE_SOURCE: "false"
       INITIAL_SCAN: "true"
+      RESCAN_INTERVAL: "120"
       BINDERY_URL: http://bindery:8787
       BINDERY_API_KEY: ${BINDERY_API_KEY}
       BINDERY_SYNC: "true"

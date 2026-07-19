@@ -51,6 +51,9 @@ FOLDER_COALESCE = os.environ.get("FOLDER_COALESCE", "true").lower() in {
     "yes",
 }
 FOLDER_COALESCE_INTERVAL = float(os.environ.get("FOLDER_COALESCE_INTERVAL", "300"))
+# Periodic full-tree AZW3 scan — needed because Docker Desktop / Windows
+# bind mounts often do not deliver reliable inotify events to watchdog.
+RESCAN_INTERVAL = float(os.environ.get("RESCAN_INTERVAL", "120"))
 SOURCE_SUFFIXES = {".azw", ".azw3"}
 # Calibre defaults to EPUB 2; Storyteller prefers EPUB 3 (2 still works with a warning).
 EPUB_VERSION = os.environ.get("EPUB_VERSION", "3").strip() or "3"
@@ -126,6 +129,33 @@ def should_convert(source: Path) -> bool:
         return True
 
 
+def _after_epub_ready(source: Path, target: Path) -> None:
+    bindery_handled = False
+    if _bindery.enabled:
+        try:
+            bindery_handled = _bindery.replace_azw3_with_epub(source, target)
+        except Exception:
+            log.exception("Bindery sync failed for %s", source)
+
+    # Bindery DELETE ?format=ebook already removes the AZW3 when sync works.
+    if DELETE_SOURCE and source.exists() and not bindery_handled:
+        source.unlink(missing_ok=True)
+        log.info("Deleted source %s", source)
+
+    if _storyteller.enabled:
+        # Give Storyteller's auto-import a moment to see the new EPUB.
+        time.sleep(float(os.environ.get("STORYTELLER_MERGE_DELAY", "15")))
+        # Strip Bindery "Title (2008)" / "Title (2008) (2)" folder noise
+        title_guess = re.sub(
+            r"\s*\(\d{4}\)\s*(\(\d{1,3}\)\s*)?$", "", source.parent.name
+        ).strip() or source.stem
+        try:
+            if not _storyteller.try_merge_for_title(title_guess):
+                _storyteller.merge_all_pairs()
+        except Exception:
+            log.exception("Storyteller merge failed for %s", title_guess)
+
+
 def convert(source: Path) -> None:
     source = source.resolve()
     with _lock:
@@ -134,65 +164,49 @@ def convert(source: Path) -> None:
         _inflight.add(source)
 
     try:
-        if not should_convert(source):
+        target = epub_path_for(source)
+        needs_convert = should_convert(source)
+        if not needs_convert and not (target.exists() and _bindery.enabled):
             log.debug("Skip %s (epub up to date)", source)
             return
         if not wait_until_stable(source):
             log.warning("Source disappeared before convert: %s", source)
             return
 
-        target = epub_path_for(source)
-        # Must end in .epub — Calibre picks the output plugin from the extension.
-        tmp = target.with_name(f".{target.stem}.converting.epub")
-        if tmp.exists():
-            tmp.unlink()
-
-        log.info("Converting %s -> %s (epub %s)", source, target, EPUB_VERSION)
-        cmd = [EBOOK_CONVERT, str(source), str(tmp), "--epub-version", EPUB_VERSION]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            log.error(
-                "Conversion failed for %s (exit %s): %s",
-                source,
-                result.returncode,
-                (result.stderr or result.stdout or "").strip()[-2000:],
-            )
+        if needs_convert:
+            # Must end in .epub — Calibre picks the output plugin from the extension.
+            tmp = target.with_name(f".{target.stem}.converting.epub")
             if tmp.exists():
-                tmp.unlink(missing_ok=True)
-            return
+                tmp.unlink()
 
-        tmp.replace(target)
-        log.info("Wrote %s", target)
+            log.info("Converting %s -> %s (epub %s)", source, target, EPUB_VERSION)
+            cmd = [EBOOK_CONVERT, str(source), str(tmp), "--epub-version", EPUB_VERSION]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                log.error(
+                    "Conversion failed for %s (exit %s): %s",
+                    source,
+                    result.returncode,
+                    (result.stderr or result.stdout or "").strip()[-2000:],
+                )
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                return
 
-        bindery_handled = False
-        if _bindery.enabled:
-            try:
-                bindery_handled = _bindery.replace_azw3_with_epub(source, target)
-            except Exception:
-                log.exception("Bindery sync failed for %s", source)
+            tmp.replace(target)
+            log.info("Wrote %s", target)
+        else:
+            log.info(
+                "EPUB already present for %s — syncing Bindery ebook link",
+                source,
+            )
 
-        # Bindery DELETE ?format=ebook already removes the AZW3 when sync works.
-        if DELETE_SOURCE and source.exists() and not bindery_handled:
-            source.unlink(missing_ok=True)
-            log.info("Deleted source %s", source)
-
-        if _storyteller.enabled:
-            # Give Storyteller's auto-import a moment to see the new EPUB.
-            time.sleep(float(os.environ.get("STORYTELLER_MERGE_DELAY", "15")))
-            # Strip Bindery "Title (2008)" / "Title (2008) (2)" folder noise
-            title_guess = re.sub(
-                r"\s*\(\d{4}\)\s*(\(\d{1,3}\)\s*)?$", "", source.parent.name
-            ).strip() or source.stem
-            try:
-                if not _storyteller.try_merge_for_title(title_guess):
-                    _storyteller.merge_all_pairs()
-            except Exception:
-                log.exception("Storyteller merge failed for %s", title_guess)
+        _after_epub_ready(source, target)
     finally:
         with _lock:
             _inflight.discard(source)
@@ -301,14 +315,53 @@ class Handler(FileSystemEventHandler):
         schedule(Path(event.dest_path))
 
 
-def initial_scan() -> None:
+def scan_sources(label: str = "scan") -> int:
+    """Queue AZW/AZW3 files that need convert and/or Bindery EPUB sync."""
     pattern = "**/*" if RECURSIVE else "*"
     found = 0
+    seen: set[Path] = set()
     for path in LIBRARY_DIR.glob(pattern):
         if is_source(path) and should_convert(path):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
             found += 1
-            schedule(path)
-    log.info("Initial scan queued %s source file(s)", found)
+            schedule(resolved)
+    # Bindery may still track AZW3 even when an EPUB already exists beside it
+    # (common after a grab when watchdog missed the create event).
+    if _bindery.enabled:
+        try:
+            for path in _bindery.list_tracked_azw_sources():
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                found += 1
+                schedule(resolved)
+        except Exception:
+            log.exception("%s: Bindery AZW3 catalogue sweep failed", label)
+    if found:
+        log.info("%s queued %s source file(s)", label.capitalize(), found)
+    else:
+        log.debug("%s found no AZW/AZW3 work", label.capitalize())
+    return found
+
+
+def initial_scan() -> None:
+    scan_sources("initial scan")
+
+
+def rescan_loop() -> None:
+    """Poll the library tree for AZW3s missed by watchdog on Docker/Windows."""
+    if RESCAN_INTERVAL <= 0:
+        return
+    while True:
+        time.sleep(RESCAN_INTERVAL)
+        try:
+            scan_sources("periodic scan")
+        except Exception:
+            log.exception("Periodic AZW3 scan failed")
 
 
 def main() -> None:
@@ -338,6 +391,13 @@ def main() -> None:
 
     worker = threading.Thread(target=drain_pending, name="converter", daemon=True)
     worker.start()
+
+    if RESCAN_INTERVAL > 0:
+        rescan_worker = threading.Thread(
+            target=rescan_loop, name="azw3-rescan", daemon=True
+        )
+        rescan_worker.start()
+        log.info("Periodic AZW3 scan enabled (every %ss)", int(RESCAN_INTERVAL))
 
     merge_worker = threading.Thread(
         target=storyteller_merge_loop, name="storyteller-merge", daemon=True

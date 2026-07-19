@@ -25,6 +25,7 @@ services:
       LIBRARY_DIR: /media/books
       DELETE_SOURCE: ${DELETE_SOURCE:-false}
       INITIAL_SCAN: ${INITIAL_SCAN:-true}
+      RESCAN_INTERVAL: ${RESCAN_INTERVAL:-120}
       STABLE_SECONDS: ${STABLE_SECONDS:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       BINDERY_URL: ${BINDERY_URL:-http://bindery:8787}

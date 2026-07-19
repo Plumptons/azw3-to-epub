@@ -43,6 +43,44 @@ class BinderyClient:
             return str(resolved).replace("\\", "/")
         return f"{self.bindery_library_dir}/{rel.as_posix()}"
 
+    def local_path(self, bindery_file: str) -> Path | None:
+        """Map a Bindery library path back onto our LIBRARY_DIR mount."""
+        normalized = bindery_file.replace("\\", "/").rstrip("/")
+        root = self.bindery_library_dir.rstrip("/")
+        root_l = root.lower()
+        path_l = normalized.lower()
+        if path_l == root_l or path_l.startswith(root_l + "/"):
+            rel = normalized[len(root) :].lstrip("/")
+            return (self.library_dir / rel).resolve()
+        # Case-insensitive Books vs books, etc.
+        parts = normalized.split("/")
+        for i, part in enumerate(parts):
+            if part.lower() in {"books", "book", "ebooks", "media"}:
+                # Prefer segment after .../books/
+                if part.lower() == "books" and i + 1 < len(parts):
+                    rel = "/".join(parts[i + 1 :])
+                    return (self.library_dir / rel).resolve()
+        return None
+
+    def list_tracked_azw_sources(self) -> list[Path]:
+        """Return local AZW/AZW3 paths Bindery still tracks as the ebook file."""
+        found: list[Path] = []
+        seen: set[str] = set()
+        for book in self.list_all_books():
+            for path in self._ebook_paths(book):
+                lower = path.replace("\\", "/").lower()
+                if not lower.endswith((".azw", ".azw3")):
+                    continue
+                local = self.local_path(path)
+                if local is None or not local.is_file():
+                    continue
+                key = str(local)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(local)
+        return found
+
     def _request(
         self,
         method: str,
@@ -537,6 +575,19 @@ class BinderyClient:
                 source,
             )
             return False
+
+        try:
+            book = self.get_book(book_id)
+        except Exception:
+            book = {}
+        ebook_paths = self._ebook_paths(book) if book else []
+        if ebook_paths and all(p.lower().endswith(".epub") for p in ebook_paths):
+            log.debug(
+                "Bindery book %s already tracks EPUB — skipping sync for %s",
+                book_id,
+                source,
+            )
+            return True
 
         # Park EPUB under a different stem so delete's sibling sweep can't kill it.
         parked = epub.with_name(f"{epub.stem}{TEMP_STEM_SUFFIX}.epub")

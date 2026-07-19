@@ -254,15 +254,17 @@ class BinderyClient:
         return False
 
     def probe_audiobooks_for_ebooks(self) -> dict[str, int]:
-        """Promote ebook-only books to ``both`` when indexers have audiobooks.
+        """Keep ``both`` only when indexers actually have audiobooks.
 
-        For each monitored ebook-without-audio book:
-        1. Set mediaType to ``both`` (Bindery marks missing audio as wanted)
-        2. Interactive-search; if Bindery's dual search is flaky, also probe as
-           ``audiobook`` so category filters actually hit audio indexers
-        3. Keep ``both`` + queue search+grab when audio releases exist
-        4. Otherwise revert to ``ebook``
+        Candidates are monitored books that already have an ebook on disk but
+        no audiobook, with mediaType ``ebook`` or ``both``:
 
+        1. Probe indexers for audiobook releases (``both``, then ``audiobook``
+           if needed — Bindery's dual interactive search is flaky)
+        2. If releases exist → set/keep ``both`` and queue search+grab
+        3. If none → set/keep ``ebook`` (so stale ``both`` books get demoted)
+
+        Mid-pipeline statuses (downloading/downloaded) are left alone.
         Returns counts: candidates, promoted, reverted, skipped, errors.
         """
         stats = {
@@ -293,9 +295,13 @@ class BinderyClient:
             if not book.get("monitored"):
                 continue
             media = (book.get("mediaType") or "ebook").lower()
-            if media != "ebook":
+            if media not in {"ebook", "both"}:
                 continue
             if not self._has_ebook(book) or self._has_audiobook(book):
+                continue
+            status = (book.get("status") or "").lower()
+            if status in {"downloading", "downloaded"}:
+                stats["skipped"] += 1
                 continue
             last = probed.get(str(book_id))
             if isinstance(last, (int, float)) and now - float(last) < cooldown:
@@ -305,7 +311,7 @@ class BinderyClient:
 
         stats["candidates"] = len(candidates)
         if not candidates:
-            log.info("Bindery audio probe: no ebook-only candidates")
+            log.info("Bindery audio probe: no ebook-without-audio candidates")
             return stats
 
         log.info(
@@ -317,6 +323,7 @@ class BinderyClient:
         for book in candidates[:limit]:
             book_id = int(book["id"])
             title = book.get("title") or book_id
+            original_media = (book.get("mediaType") or "ebook").lower()
             try:
                 self.set_media_type(book_id, "both")
                 results = self.interactive_search(book_id)
@@ -341,7 +348,7 @@ class BinderyClient:
                     self.search_wanted([book_id])
                     stats["promoted"] += 1
                     log.info(
-                        "Audio available for %s (%s) — left as both (%s release(s))",
+                        "Audio available for %s (%s) — set both (%s release(s))",
                         title,
                         book_id,
                         len(audio_hits),
@@ -350,18 +357,20 @@ class BinderyClient:
                     self.set_media_type(book_id, "ebook")
                     stats["reverted"] += 1
                     log.info(
-                        "No audiobook releases for %s (%s) — reverted to ebook",
+                        "No audiobook releases for %s (%s) — set ebook (was %s)",
                         title,
                         book_id,
+                        original_media,
                     )
                 probed[str(book_id)] = now
             except Exception:
                 stats["errors"] += 1
                 log.exception("Audio probe failed for book %s (%s)", book_id, title)
                 try:
-                    self.set_media_type(book_id, "ebook")
+                    # Prefer restoring the prior media type on hard failures.
+                    self.set_media_type(book_id, original_media or "ebook")
                 except Exception:
-                    log.exception("Could not restore ebook mediaType for %s", book_id)
+                    log.exception("Could not restore mediaType for %s", book_id)
 
         self._save_probe_state(state)
         log.info(

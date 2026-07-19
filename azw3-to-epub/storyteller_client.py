@@ -18,24 +18,66 @@ def _truthy(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes"}
 
 
-def normalize_title(title: str) -> str:
-    """Normalize titles so Bindery duplicate folders still match.
+_NOISE_PHRASES = (
+    "unabridged",
+    "abridged",
+    "unabr",
+    "with bonus short story",
+    "with bonus",
+)
 
-    Bindery often creates:
-      The Temporal Void (2008)/          <- ebook
-      The Temporal Void (2008) (2)/      <- audiobook
-    Storyteller then imports them as separate books with those titles.
+
+def normalize_title(title: str) -> str:
+    """Normalize titles for ebook/audiobook pairing across naming styles.
+
+    Handles Bindery `(2)` folders and common audiobook/ebook title drift:
+      The Temporal Void (2008)
+      The Temporal Void (2008) (2)
+      The Temporal Void (Commonwealth: The Void Trilogy Book 2)
+      Night Without Stars (Unabridged)
+      Commonwealth Saga Book 1: Pandora's Star
     """
     text = title.lower().strip()
-    # Drop year suffixes: (2008)
-    text = re.sub(r"\s*\(\d{4}\)\s*", " ", text)
-    # Drop Bindery collision suffixes: (2), (3), …
-    text = re.sub(r"\s*\(\d{1,3}\)\s*", " ", text)
+    # Prefer the part after the last colon when it looks like a series prefix.
+    # "commonwealth saga book 1: pandora's star" -> "pandora's star"
+    if ":" in text:
+        left, right = text.rsplit(":", 1)
+        if len(right.strip()) >= 4 and (
+            "book" in left or "saga" in left or "trilogy" in left or "series" in left
+        ):
+            text = right.strip()
+    # Drop all parentheticals: years, (2), series subtitles, Unabridged, etc.
+    text = re.sub(r"\([^)]*\)", " ", text)
+    # "Commonwealth Saga 2 - Judas Unchained" -> keep trailing title after dash
+    # when the left side looks like a series label.
+    if " - " in text:
+        left, right = text.rsplit(" - ", 1)
+        if len(right.strip()) >= 4 and (
+            "book" in left or "saga" in left or "trilogy" in left or "void" in left
+            or re.search(r"\b\d+\b", left)
+        ):
+            text = right.strip()
+    for phrase in _NOISE_PHRASES:
+        text = text.replace(phrase, " ")
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    # Trailing lone duplicate index left after stripping punctuation
     text = re.sub(r"\s+\d{1,3}$", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def titles_match(a: str, b: str) -> bool:
+    """True when normalized titles are equal or one cleanly contains the other."""
+    na, nb = normalize_title(a), normalize_title(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    # Avoid weak matches on tiny titles ("red", "gold").
+    if len(shorter) < 8:
+        return False
+    padded = f" {longer} "
+    return longer.startswith(shorter + " ") or f" {shorter} " in padded
 
 
 def normalize_name(name: str) -> str:
@@ -179,14 +221,14 @@ class StorytellerClient:
         used_audio: set[str] = set()
 
         for ebook in ebook_only:
-            e_title = normalize_title(str(ebook.get("title") or ""))
-            if not e_title:
+            e_raw = str(ebook.get("title") or "")
+            if not normalize_title(e_raw):
                 continue
             candidates = [
                 audio
                 for audio in audio_only
                 if str(audio.get("uuid")) not in used_audio
-                and normalize_title(str(audio.get("title") or "")) == e_title
+                and titles_match(e_raw, str(audio.get("title") or ""))
                 and self.authors_compatible(ebook, audio)
             ]
             if len(candidates) != 1:

@@ -8,6 +8,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -95,11 +96,11 @@ class StorytellerClient:
         self.base_url = os.environ.get("STORYTELLER_URL", "").rstrip("/")
         self.username = os.environ.get("STORYTELLER_USERNAME", "").strip()
         self.password = os.environ.get("STORYTELLER_PASSWORD", "").strip()
-        self.enabled = (
-            bool(self.base_url)
-            and bool(self.username)
-            and bool(self.password)
-            and _truthy("STORYTELLER_AUTO_MERGE", "true")
+        self.configured = bool(self.base_url and self.username and self.password)
+        # Legacy "enabled" flag = merge feature (keeps existing compose behavior).
+        self.enabled = self.configured and _truthy("STORYTELLER_AUTO_MERGE", "true")
+        self.readaloud_enabled = self.configured and _truthy(
+            "STORYTELLER_AUTO_READALOUD", "true"
         )
         self._token: str | None = None
         self._user_id: str | None = None
@@ -359,3 +360,94 @@ class StorytellerClient:
             return False
         self.merge_pair(pairs[0][0], pairs[0][1])
         return True
+
+    @staticmethod
+    def _media_present(media: Any) -> bool:
+        if not isinstance(media, dict) or not media.get("filepath"):
+            return False
+        return not bool(media.get("missing"))
+
+    def start_processing(self, book_uuid: str, restart: str | None = None) -> None:
+        """POST /api/v2/books/{uuid}/process — queue readaloud alignment."""
+        path = f"/api/v2/books/{book_uuid}/process"
+        if restart:
+            path = f"{path}?restart={urllib.parse.quote(restart)}"
+        self._request("POST", path, timeout=60)
+
+    def find_readaloud_candidates(
+        self, books: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Books with both formats that still need a readaloud created."""
+        books = books if books is not None else self.list_books()
+        candidates: list[dict[str, Any]] = []
+        for book in books:
+            if not self._media_present(book.get("ebook")):
+                continue
+            if not self._media_present(book.get("audiobook")):
+                continue
+            readaloud = book.get("readaloud")
+            if not readaloud:
+                candidates.append(book)
+                continue
+            status = str(readaloud.get("status") or "").upper()
+            # Already done or actively working — leave alone.
+            if status in {"ALIGNED", "PROCESSING", "QUEUED", "RUNNING"}:
+                # ALIGNED but file gone → allow a full restart.
+                if status == "ALIGNED" and (
+                    readaloud.get("missing") or not readaloud.get("filepath")
+                ):
+                    candidates.append(book)
+                continue
+            # STOPPED / FAILED / etc. → retry.
+            if status in {"STOPPED", "FAILED", "ERROR", "CANCELLED", ""}:
+                candidates.append(book)
+        return candidates
+
+    def start_readalouds(self) -> int:
+        """Queue Storyteller readaloud processing for dual-format books."""
+        if not self.readaloud_enabled:
+            return 0
+        limit = max(1, int(os.environ.get("STORYTELLER_READALOUD_LIMIT", "2")))
+        candidates = self.find_readaloud_candidates()
+        if not candidates:
+            log.debug("Storyteller readaloud: no dual-format candidates")
+            return 0
+
+        log.info(
+            "Storyteller readaloud: %s candidate(s), starting up to %s",
+            len(candidates),
+            limit,
+        )
+        started = 0
+        for book in candidates[:limit]:
+            uuid = book.get("uuid")
+            title = book.get("title") or uuid
+            if not uuid:
+                continue
+            readaloud = book.get("readaloud") or {}
+            status = str(readaloud.get("status") or "").upper()
+            # Fresh start vs retry a previously stopped/failed/broken job.
+            restart = None
+            if status in {"STOPPED", "FAILED", "ERROR", "CANCELLED"} or (
+                status == "ALIGNED"
+                and (readaloud.get("missing") or not readaloud.get("filepath"))
+            ):
+                restart = "full"
+            try:
+                self.start_processing(str(uuid), restart=restart)
+                started += 1
+                log.info(
+                    "Queued Storyteller readaloud for %s (%s%s)",
+                    title,
+                    uuid,
+                    f", restart={restart}" if restart else "",
+                )
+            except Exception:
+                log.exception(
+                    "Failed starting Storyteller readaloud for %s (%s)",
+                    title,
+                    uuid,
+                )
+        if started:
+            log.info("Storyteller readaloud queued %s book(s)", started)
+        return started

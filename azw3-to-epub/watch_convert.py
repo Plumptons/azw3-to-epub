@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
@@ -28,6 +29,16 @@ POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
 RECURSIVE = os.environ.get("RECURSIVE", "true").lower() in {"1", "true", "yes"}
 # How often to sweep Storyteller for ebook/audiobook pairs (0 = only after converts)
 STORYTELLER_MERGE_INTERVAL = float(os.environ.get("STORYTELLER_MERGE_INTERVAL", "300"))
+# Queue readaloud alignment for books that already have ebook + audiobook
+STORYTELLER_AUTO_READALOUD = os.environ.get(
+    "STORYTELLER_AUTO_READALOUD", "true"
+).lower() in {"1", "true", "yes"}
+STORYTELLER_READALOUD_INTERVAL = float(
+    os.environ.get("STORYTELLER_READALOUD_INTERVAL", "1800")
+)
+# Local-time window (container TZ) when readaloud jobs may be queued
+STORYTELLER_READALOUD_START = os.environ.get("STORYTELLER_READALOUD_START", "00:01")
+STORYTELLER_READALOUD_END = os.environ.get("STORYTELLER_READALOUD_END", "06:00")
 # How often to ask Bindery to search+grab Wanted books (Bindery's own loop is ~12h)
 BINDERY_SEARCH_INTERVAL = float(os.environ.get("BINDERY_SEARCH_INTERVAL", "3600"))
 BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "true").lower() in {
@@ -322,6 +333,79 @@ def bindery_audio_probe_loop() -> None:
         time.sleep(BINDERY_AUDIO_PROBE_INTERVAL)
 
 
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    hour_s, minute_s = value.strip().split(":", 1)
+    hour, minute = int(hour_s), int(minute_s)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"invalid HH:MM {value!r}")
+    return hour, minute
+
+
+def _minutes_since_midnight(hour: int, minute: int) -> int:
+    return hour * 60 + minute
+
+
+def _in_readaloud_window(now: datetime | None = None) -> bool:
+    """True when local time is in [START, END) (handles overnight windows)."""
+    now = now or datetime.now()
+    start_h, start_m = _parse_hhmm(STORYTELLER_READALOUD_START)
+    end_h, end_m = _parse_hhmm(STORYTELLER_READALOUD_END)
+    cur = _minutes_since_midnight(now.hour, now.minute)
+    start = _minutes_since_midnight(start_h, start_m)
+    end = _minutes_since_midnight(end_h, end_m)
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    # Overnight window, e.g. 22:00–06:00
+    return cur >= start or cur < end
+
+
+def _seconds_until_readaloud_window(now: datetime | None = None) -> float:
+    now = now or datetime.now()
+    if _in_readaloud_window(now):
+        return 0.0
+    start_h, start_m = _parse_hhmm(STORYTELLER_READALOUD_START)
+    target = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
+
+
+def storyteller_readaloud_loop() -> None:
+    """Queue Storyteller readaloud jobs for dual-format books (night window only)."""
+    if not (
+        _storyteller.readaloud_enabled
+        and STORYTELLER_AUTO_READALOUD
+        and STORYTELLER_READALOUD_INTERVAL > 0
+    ):
+        return
+    time.sleep(120)
+    while True:
+        try:
+            wait = _seconds_until_readaloud_window()
+            if wait > 0:
+                log.info(
+                    "Storyteller readaloud idle until %s–%s window (sleep %ss)",
+                    STORYTELLER_READALOUD_START,
+                    STORYTELLER_READALOUD_END,
+                    int(wait),
+                )
+                time.sleep(wait)
+                continue
+            # Merge first so ebook-only + audio-only become dual-format candidates.
+            if _storyteller.enabled:
+                _storyteller.merge_all_pairs()
+            _storyteller.start_readalouds()
+        except Exception:
+            log.exception("Storyteller readaloud sweep failed")
+        # Stay responsive to window end; don't sleep past 06:00.
+        if _in_readaloud_window():
+            time.sleep(STORYTELLER_READALOUD_INTERVAL)
+        else:
+            time.sleep(min(60.0, STORYTELLER_READALOUD_INTERVAL))
+
+
 class Handler(FileSystemEventHandler):
     def on_created(self, event):  # type: ignore[no-untyped-def]
         if event.is_directory:
@@ -466,6 +550,19 @@ def main() -> None:
         log.info(
             "Bindery audiobook probe enabled (every %ss)",
             int(BINDERY_AUDIO_PROBE_INTERVAL),
+        )
+
+    readaloud_worker = threading.Thread(
+        target=storyteller_readaloud_loop, name="storyteller-readaloud", daemon=True
+    )
+    readaloud_worker.start()
+    if _storyteller.readaloud_enabled:
+        log.info(
+            "Storyteller auto-readaloud enabled (%s–%s local, every %ss, limit=%s)",
+            STORYTELLER_READALOUD_START,
+            STORYTELLER_READALOUD_END,
+            int(STORYTELLER_READALOUD_INTERVAL),
+            os.environ.get("STORYTELLER_READALOUD_LIMIT", "2"),
         )
 
     if INITIAL_SCAN:

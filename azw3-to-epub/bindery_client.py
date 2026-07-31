@@ -208,6 +208,82 @@ class BinderyClient:
         log.info("Bindery wanted search: triggering search+grab for %s book(s)", len(ids))
         return self.search_wanted(ids)
 
+    def list_queue(self) -> list[dict[str, Any]]:
+        """Return Bindery download queue items (GET /queue)."""
+        payload = self._request("GET", "/queue", timeout=60)
+        if isinstance(payload, list):
+            return [i for i in payload if isinstance(i, dict)]
+        if isinstance(payload, dict):
+            items = payload.get("items") or []
+            return [i for i in items if isinstance(i, dict)]
+        return []
+
+    def delete_queue_item(self, download_id: int, *, delete_files: bool = False) -> None:
+        """Remove one queue row. Never pass deleteFiles unless explicitly requested."""
+        path = f"/queue/{download_id}"
+        if delete_files:
+            path += "?deleteFiles=true"
+        self._request("DELETE", path, timeout=60)
+
+    def clear_stale_queue(
+        self,
+        statuses: set[str] | None = None,
+    ) -> int:
+        """Delete failed/imported queue items without touching files on disk.
+
+        Stale terminal rows block Bindery from re-grabbing the same book.
+        """
+        if not self.enabled or not _truthy("BINDERY_CLEAR_QUEUE", "true"):
+            return 0
+        wanted = {
+            s.lower()
+            for s in (
+                statuses
+                or {"failed", "imported", "importfailed", "completed"}
+            )
+        }
+        removed = 0
+        # Repeat a few times in case Bindery pages/caps the list.
+        for _round in range(10):
+            items = self.list_queue()
+            stale = [
+                item
+                for item in items
+                if isinstance(item.get("id"), int)
+                and str(item.get("status") or "").lower() in wanted
+            ]
+            if not stale:
+                break
+            for item in stale:
+                download_id = int(item["id"])
+                title = item.get("title") or download_id
+                status = item.get("status")
+                try:
+                    self.delete_queue_item(download_id, delete_files=False)
+                    removed += 1
+                    log.info(
+                        "Cleared Bindery queue item %s (%s, status=%s)",
+                        download_id,
+                        title,
+                        status,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed clearing Bindery queue item %s (%s)",
+                        download_id,
+                        title,
+                    )
+            time.sleep(0.2)
+        if removed:
+            log.info(
+                "Cleared %s stale Bindery queue item(s) (statuses=%s, files kept)",
+                removed,
+                sorted(wanted),
+            )
+        else:
+            log.debug("Bindery queue: no stale failed/imported items")
+        return removed
+
     def _probe_state_path(self) -> Path:
         configured = os.environ.get("BINDERY_AUDIO_PROBE_STATE", "").strip()
         if configured:

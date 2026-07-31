@@ -35,6 +35,15 @@ BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "true").lower() 
     "true",
     "yes",
 }
+# Clear failed/imported Bindery queue rows (never deletes download files)
+BINDERY_CLEAR_QUEUE = os.environ.get("BINDERY_CLEAR_QUEUE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+BINDERY_CLEAR_QUEUE_INTERVAL = float(
+    os.environ.get("BINDERY_CLEAR_QUEUE_INTERVAL", "300")
+)
 # Probe ebook-only books for audiobook releases; keep both or revert to ebook
 BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "true").lower() in {
     "1",
@@ -283,6 +292,21 @@ def bindery_wanted_search_loop() -> None:
         time.sleep(BINDERY_SEARCH_INTERVAL)
 
 
+def bindery_clear_queue_loop() -> None:
+    """Remove failed/imported Bindery queue rows so re-grabs are not blocked."""
+    if not (
+        _bindery.enabled and BINDERY_CLEAR_QUEUE and BINDERY_CLEAR_QUEUE_INTERVAL > 0
+    ):
+        return
+    time.sleep(45)
+    while True:
+        try:
+            _bindery.clear_stale_queue()
+        except Exception:
+            log.exception("Bindery queue cleanup failed")
+        time.sleep(BINDERY_CLEAR_QUEUE_INTERVAL)
+
+
 def bindery_audio_probe_loop() -> None:
     """Promote ebook-only books to both when audiobook releases exist."""
     if not (
@@ -422,6 +446,16 @@ def main() -> None:
         log.info(
             "Bindery wanted search enabled (every %ss)",
             int(BINDERY_SEARCH_INTERVAL),
+        )
+
+    clear_queue_worker = threading.Thread(
+        target=bindery_clear_queue_loop, name="bindery-clear-queue", daemon=True
+    )
+    clear_queue_worker.start()
+    if _bindery.enabled and BINDERY_CLEAR_QUEUE:
+        log.info(
+            "Bindery queue cleanup enabled (every %ss; failed/imported, files kept)",
+            int(BINDERY_CLEAR_QUEUE_INTERVAL),
         )
 
     audio_probe_worker = threading.Thread(

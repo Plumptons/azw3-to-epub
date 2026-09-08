@@ -64,12 +64,16 @@ BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "true").lower() in {
 BINDERY_AUDIO_PROBE_INTERVAL = float(
     os.environ.get("BINDERY_AUDIO_PROBE_INTERVAL", "3600")
 )
-# Bindery series titles -> Storyteller collections (membership for books already imported)
-STORYTELLER_SYNC_COLLECTIONS = os.environ.get(
-    "STORYTELLER_SYNC_COLLECTIONS", "true"
+# Bindery series -> Storyteller series (with position). Collections flag kept as alias.
+STORYTELLER_SYNC_SERIES = os.environ.get(
+    "STORYTELLER_SYNC_SERIES",
+    os.environ.get("STORYTELLER_SYNC_COLLECTIONS", "true"),
 ).lower() in {"1", "true", "yes"}
-STORYTELLER_COLLECTIONS_INTERVAL = float(
-    os.environ.get("STORYTELLER_COLLECTIONS_INTERVAL", "3600")
+STORYTELLER_SERIES_INTERVAL = float(
+    os.environ.get(
+        "STORYTELLER_SERIES_INTERVAL",
+        os.environ.get("STORYTELLER_COLLECTIONS_INTERVAL", "3600"),
+    )
 )
 # Merge Bindery "Title (Year) (2)" sibling folders into the primary title folder
 FOLDER_COALESCE = os.environ.get("FOLDER_COALESCE", "true").lower() in {
@@ -340,13 +344,13 @@ def bindery_audio_probe_loop() -> None:
         time.sleep(BINDERY_AUDIO_PROBE_INTERVAL)
 
 
-def storyteller_collections_loop() -> None:
-    """Create Storyteller collections from Bindery series membership."""
+def storyteller_series_loop() -> None:
+    """Assign Storyteller series from Bindery series membership."""
     if not (
         _bindery.enabled
-        and _storyteller.collections_enabled
-        and STORYTELLER_SYNC_COLLECTIONS
-        and STORYTELLER_COLLECTIONS_INTERVAL > 0
+        and _storyteller.series_enabled
+        and STORYTELLER_SYNC_SERIES
+        and STORYTELLER_SERIES_INTERVAL > 0
     ):
         return
     time.sleep(75)
@@ -354,10 +358,10 @@ def storyteller_collections_loop() -> None:
         try:
             series = _bindery.list_all_series()
             books = _bindery.list_all_books()
-            _storyteller.sync_collections_from_bindery_series(series, books)
+            _storyteller.sync_series_from_bindery(series, books)
         except Exception:
-            log.exception("Storyteller collections sync failed")
-        time.sleep(STORYTELLER_COLLECTIONS_INTERVAL)
+            log.exception("Storyteller series sync failed")
+        time.sleep(STORYTELLER_SERIES_INTERVAL)
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -579,14 +583,14 @@ def main() -> None:
             int(BINDERY_AUDIO_PROBE_INTERVAL),
         )
 
-    collections_worker = threading.Thread(
-        target=storyteller_collections_loop, name="storyteller-collections", daemon=True
+    series_worker = threading.Thread(
+        target=storyteller_series_loop, name="storyteller-series", daemon=True
     )
-    collections_worker.start()
-    if _bindery.enabled and _storyteller.collections_enabled:
+    series_worker.start()
+    if _bindery.enabled and _storyteller.series_enabled:
         log.info(
-            "Storyteller collections from Bindery series enabled (every %ss)",
-            int(STORYTELLER_COLLECTIONS_INTERVAL),
+            "Storyteller series from Bindery enabled (every %ss)",
+            int(STORYTELLER_SERIES_INTERVAL),
         )
 
     readaloud_worker = threading.Thread(

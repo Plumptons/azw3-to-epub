@@ -102,8 +102,9 @@ class StorytellerClient:
         self.readaloud_enabled = self.configured and _truthy(
             "STORYTELLER_AUTO_READALOUD", "true"
         )
-        self.collections_enabled = self.configured and _truthy(
-            "STORYTELLER_SYNC_COLLECTIONS", "true"
+        self.series_enabled = self.configured and _truthy(
+            "STORYTELLER_SYNC_SERIES",
+            os.environ.get("STORYTELLER_SYNC_COLLECTIONS", "true"),
         )
         self._token: str | None = None
         self._user_id: str | None = None
@@ -189,6 +190,57 @@ class StorytellerClient:
     def list_books(self) -> list[dict[str, Any]]:
         books = self._request("GET", "/api/v2/books")
         return books if isinstance(books, list) else []
+
+    def list_series(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/api/v2/series")
+        if isinstance(payload, list):
+            return [s for s in payload if isinstance(s, dict)]
+        if isinstance(payload, dict):
+            raw = payload.get("items") or payload.get("series") or []
+            return [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
+        return []
+
+    def update_book_series(
+        self, book_uuid: str, series: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Replace a book's series relations (creates the series if it has no uuid)."""
+        boundary = "----stboundary7MA4YWxkTrZu0gW"
+        parts: list[bytes] = [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="fields"\r\n\r\n',
+            b"uuid\r\n",
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="fields"\r\n\r\n',
+            b"series\r\n",
+        ]
+        for item in series:
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(b'Content-Disposition: form-data; name="series"\r\n\r\n')
+            parts.append(json.dumps(item).encode("utf-8"))
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        url = f"{self.base_url}/api/v2/books/{book_uuid}"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        token = self._ensure_token()
+        headers["Cookie"] = f"st_token={token}"
+        headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            url, data=b"".join(parts), headers=headers, method="PUT"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+                return json.loads(raw.decode("utf-8")) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in {401, 403}:
+                self._token = None
+            raise RuntimeError(
+                f"Storyteller PUT /api/v2/books/{book_uuid} -> HTTP {exc.code}: {detail}"
+            ) from exc
 
     def list_collections(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v2/collections")
@@ -316,22 +368,13 @@ class StorytellerClient:
             return str(int(value))
         return format(value, "g")
 
-    def _collection_reading_order(
-        self,
-        entries: list[tuple[str, float | None]],
-        books_by_uuid: dict[str, dict[str, Any]],
-    ) -> str:
-        def sort_key(item: tuple[str, float | None]) -> tuple[int, float, str]:
-            uuid, pos = item
-            title = str((books_by_uuid.get(uuid) or {}).get("title") or "")
-            return (0 if pos is not None else 1, pos if pos is not None else 0.0, title.casefold())
-
-        lines: list[str] = []
-        for uuid, pos in sorted(entries, key=sort_key):
-            title = str((books_by_uuid.get(uuid) or {}).get("title") or uuid)
-            number = self._format_series_position(pos)
-            lines.append(f"{number}. {title}" if number else title)
-        return "\n".join(lines)
+    @staticmethod
+    def _position_payload(value: float | None) -> int | float | None:
+        if value is None:
+            return None
+        if value.is_integer():
+            return int(value)
+        return value
 
     def _match_storyteller_book(
         self, bindery_book: dict[str, Any], storyteller_books: list[dict[str, Any]]
@@ -347,40 +390,61 @@ class StorytellerClient:
             return matches[0]
         return None
 
-    def _book_collection_ids(self, book: dict[str, Any]) -> set[str]:
-        ids: set[str] = set()
-        for coll in book.get("collections") or []:
-            if isinstance(coll, dict) and coll.get("uuid"):
-                ids.add(str(coll["uuid"]))
-        return ids
+    def _resolve_storyteller_series(
+        self, name: str, existing: dict[str, dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        key = self._collection_name_key(name)
+        if key in existing:
+            return existing[key]
+        for series in existing.values():
+            if titles_match(name, str(series.get("name") or "")):
+                return series
+        return None
 
-    def sync_collections_from_bindery_series(
+    @staticmethod
+    def _book_has_series(
+        book: dict[str, Any], series_uuid: str | None, position: float | None
+    ) -> bool:
+        rels = [s for s in (book.get("series") or []) if isinstance(s, dict)]
+        if len(rels) != 1:
+            return False
+        rel = rels[0]
+        if series_uuid and str(rel.get("uuid") or "") != series_uuid:
+            return False
+        if series_uuid is None:
+            return False
+        if position is None:
+            return True
+        try:
+            return float(rel.get("position")) == float(position)
+        except (TypeError, ValueError):
+            return False
+
+    def sync_series_from_bindery(
         self,
         series_list: list[dict[str, Any]],
         bindery_books: list[dict[str, Any]] | None = None,
     ) -> int:
-        """Create Storyteller collections from Bindery series.
+        """Assign Storyteller series from Bindery series membership.
 
-        A book that appears in multiple series is assigned only to the
-        largest series (Bindery member count). Smaller overlapping series are
-        not created; leftover collections from a prior sync are deleted.
+        A book in multiple Bindery series is assigned only to the largest
+        series. Position comes from Bindery. Leftover collections from the
+        earlier collection sync are deleted.
         """
-        if not self.collections_enabled:
+        if not self.series_enabled:
             return 0
         storyteller_books = self.list_books()
         books_by_uuid = {
             str(b.get("uuid")): b for b in storyteller_books if b.get("uuid")
         }
-        existing = {
-            self._collection_name_key(str(c.get("name") or "")): c
-            for c in self.list_collections()
-            if c.get("name") and c.get("uuid")
+        existing_series = {
+            self._collection_name_key(str(s.get("name") or "")): s
+            for s in self.list_series()
+            if s.get("name") and s.get("uuid")
         }
         authors_by_id = self._bindery_authors_by_id(bindery_books or [])
 
-        # series name -> (bindery_count, matched uuid+position)
         series_matches: list[tuple[str, int, list[tuple[str, float | None]]]] = []
-        bindery_series_keys: set[str] = set()
         for series in series_list:
             name = str(series.get("title") or "").strip()
             if not name:
@@ -388,8 +452,6 @@ class StorytellerClient:
             members = series.get("books") or []
             if not isinstance(members, list):
                 continue
-            bindery_series_keys.add(self._collection_name_key(name))
-            bindery_count = len(members)
             matched: list[tuple[str, float | None]] = []
             seen: set[str] = set()
             for member in members:
@@ -405,13 +467,11 @@ class StorytellerClient:
                 seen.add(uuid)
                 pos = self._parse_series_position(bindery_book.get("positionInSeries"))
                 matched.append((uuid, pos))
-            series_matches.append((name, bindery_count, matched))
+            series_matches.append((name, len(members), matched))
 
-        # Each Storyteller book -> winning series (most Bindery members).
         winners: dict[str, tuple[int, int, str, float | None]] = {}
         for name, bindery_count, matched in series_matches:
-            matched_count = len(matched)
-            rank = (bindery_count, matched_count)
+            rank = (bindery_count, len(matched))
             for uuid, pos in matched:
                 current = winners.get(uuid)
                 if current is None or rank > current[:2]:
@@ -424,143 +484,88 @@ class StorytellerClient:
             assigned.setdefault(name, []).append((uuid, pos))
 
         created = 0
-        added = 0
-        removed = 0
-        deleted = 0
-        numbered = 0
+        updated = 0
+        skipped = sum(1 for _n, _c, matched in series_matches if not matched)
 
         for name, entries in assigned.items():
-            uuids = [uuid for uuid, _pos in entries]
-            description = self._collection_reading_order(entries, books_by_uuid)
-            key = self._collection_name_key(name)
-            collection = existing.get(key)
-            if collection is None:
-                collection = self.create_collection(
-                    name, public=True, description=description
-                )
-                existing[key] = collection
+            st_series = self._resolve_storyteller_series(name, existing_series)
+            if st_series is None:
                 created += 1
-                numbered += 1
-                log.info("Created Storyteller collection %s", name)
-            collection_uuid = str(collection.get("uuid") or "")
-            if not collection_uuid:
-                continue
-            already = {
-                uuid
-                for uuid in uuids
-                if collection_uuid
-                in self._book_collection_ids(books_by_uuid.get(uuid) or {})
-            }
-            to_add = [uuid for uuid in uuids if uuid not in already]
-            extras = [
-                uuid
-                for uuid, book in books_by_uuid.items()
-                if collection_uuid in self._book_collection_ids(book)
-                and uuid not in set(uuids)
-            ]
-            if to_add:
-                self.add_books_to_collections([collection_uuid], to_add)
-                added += len(to_add)
-                log.info(
-                    "Storyteller collection %s: added %s book(s)",
-                    name,
-                    len(to_add),
+            def sort_key(item: tuple[str, float | None]) -> tuple[int, float, str]:
+                uuid, pos = item
+                title = str((books_by_uuid.get(uuid) or {}).get("title") or "")
+                return (
+                    0 if pos is not None else 1,
+                    pos if pos is not None else 0.0,
+                    title.casefold(),
                 )
-            if extras:
-                self.remove_books_from_collections([collection_uuid], extras)
-                removed += len(extras)
-                log.info(
-                    "Storyteller collection %s: removed %s book(s) belonging to a larger series",
-                    name,
-                    len(extras),
-                )
-            if (collection.get("description") or "") != description:
-                updated = self.update_collection(
-                    collection_uuid, description=description
-                )
-                if updated:
-                    existing[key] = updated
-                numbered += 1
-                log.info("Storyteller collection %s: wrote reading order", name)
 
-        winner_col_by_book: dict[str, str] = {}
-        for uuid, (_count, _matched_count, name, _pos) in winners.items():
-            col = existing.get(self._collection_name_key(name))
-            if col and col.get("uuid"):
-                winner_col_by_book[uuid] = str(col["uuid"])
-
-        strip_by_collection: dict[str, list[str]] = {}
-        for book_uuid, book in books_by_uuid.items():
-            winner_col = winner_col_by_book.get(book_uuid)
-            if not winner_col:
-                continue
-            for coll in book.get("collections") or []:
-                if not isinstance(coll, dict) or not coll.get("uuid"):
+            for uuid, pos in sorted(entries, key=sort_key):
+                book = books_by_uuid.get(uuid) or {}
+                payload: dict[str, Any] = {
+                    "name": str((st_series or {}).get("name") or name),
+                    "featured": True,
+                }
+                if st_series and st_series.get("uuid"):
+                    payload["uuid"] = str(st_series["uuid"])
+                pos_val = self._position_payload(pos)
+                if pos_val is not None:
+                    payload["position"] = pos_val
+                series_uuid = str(payload.get("uuid") or "") or None
+                if self._book_has_series(book, series_uuid, pos):
                     continue
-                ckey = self._collection_name_key(str(coll.get("name") or ""))
-                if ckey not in bindery_series_keys:
-                    continue
-                cuuid = str(coll["uuid"])
-                if cuuid != winner_col:
-                    strip_by_collection.setdefault(cuuid, []).append(book_uuid)
-        for collection_uuid, book_uuids in strip_by_collection.items():
-            unique = list(dict.fromkeys(book_uuids))
-            self.remove_books_from_collections([collection_uuid], unique)
-            removed += len(unique)
-            log.info(
-                "Removed %s book(s) from smaller overlapping collection %s",
-                len(unique),
-                collection_uuid,
-            )
+                result = self.update_book_series(uuid, [payload])
+                rels = result.get("series") if isinstance(result, dict) else None
+                if isinstance(rels, list) and rels and isinstance(rels[0], dict):
+                    st_series = rels[0]
+                    if st_series.get("name") and st_series.get("uuid"):
+                        existing_series[
+                            self._collection_name_key(str(st_series["name"]))
+                        ] = st_series
+                        existing_series[self._collection_name_key(name)] = st_series
+                books_by_uuid[uuid] = result if isinstance(result, dict) else book
+                updated += 1
+                log.info(
+                    "Storyteller series %s: set %s as #%s",
+                    payload.get("name"),
+                    book.get("title") or uuid,
+                    payload.get("position", "?"),
+                )
 
-        # Membership may have changed; refresh before deleting emptied series.
-        storyteller_books = self.list_books()
-        books_by_uuid = {
-            str(b.get("uuid")): b for b in storyteller_books if b.get("uuid")
-        }
-
-        assigned_keys = {self._collection_name_key(name) for name in assigned}
-        for key, collection in list(existing.items()):
-            if key not in bindery_series_keys or key in assigned_keys:
+        deleted = 0
+        for collection in self.list_collections():
+            uuid = str(collection.get("uuid") or "")
+            if not uuid:
                 continue
-            collection_uuid = str(collection.get("uuid") or "")
-            name = str(collection.get("name") or key)
-            if not collection_uuid:
-                continue
-            members = [
-                uuid
-                for uuid, book in books_by_uuid.items()
-                if collection_uuid in self._book_collection_ids(book)
-            ]
-            if members:
-                self.remove_books_from_collections([collection_uuid], members)
-                removed += len(members)
-            self.delete_collection(collection_uuid)
+            self.delete_collection(uuid)
             deleted += 1
-            existing.pop(key, None)
             log.info(
-                "Deleted Storyteller collection %s (smaller overlapping Bindery series)",
-                name,
+                "Deleted leftover Storyteller collection %s",
+                collection.get("name"),
             )
 
-        skipped = sum(1 for _n, _c, matched in series_matches if not matched)
-        if created or added or removed or deleted or numbered:
+        if created or updated or deleted:
             log.info(
-                "Bindery series -> Storyteller collections: created %s, added %s, "
-                "removed %s, deleted %s smaller series, numbered %s, skipped %s empty",
+                "Bindery series -> Storyteller series: created %s, updated %s book(s), "
+                "deleted %s collection(s), skipped %s empty Bindery series",
                 created,
-                added,
-                removed,
+                updated,
                 deleted,
-                numbered,
                 skipped,
             )
         else:
             log.debug(
-                "Bindery series -> Storyteller collections: no changes (%s series with no Storyteller match)",
+                "Bindery series -> Storyteller series: no changes (%s empty)",
                 skipped,
             )
-        return created + added + removed + deleted + numbered
+        return created + updated + deleted
+
+    def sync_collections_from_bindery_series(
+        self,
+        series_list: list[dict[str, Any]],
+        bindery_books: list[dict[str, Any]] | None = None,
+    ) -> int:
+        return self.sync_series_from_bindery(series_list, bindery_books)
 
     @staticmethod
     def author_names(book: dict[str, Any]) -> set[str]:

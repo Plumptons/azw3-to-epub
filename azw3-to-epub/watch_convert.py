@@ -64,6 +64,13 @@ BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "true").lower() in {
 BINDERY_AUDIO_PROBE_INTERVAL = float(
     os.environ.get("BINDERY_AUDIO_PROBE_INTERVAL", "3600")
 )
+# Bindery series titles -> Storyteller collections (membership for books already imported)
+STORYTELLER_SYNC_COLLECTIONS = os.environ.get(
+    "STORYTELLER_SYNC_COLLECTIONS", "true"
+).lower() in {"1", "true", "yes"}
+STORYTELLER_COLLECTIONS_INTERVAL = float(
+    os.environ.get("STORYTELLER_COLLECTIONS_INTERVAL", "3600")
+)
 # Merge Bindery "Title (Year) (2)" sibling folders into the primary title folder
 FOLDER_COALESCE = os.environ.get("FOLDER_COALESCE", "true").lower() in {
     "1",
@@ -333,6 +340,26 @@ def bindery_audio_probe_loop() -> None:
         time.sleep(BINDERY_AUDIO_PROBE_INTERVAL)
 
 
+def storyteller_collections_loop() -> None:
+    """Create Storyteller collections from Bindery series membership."""
+    if not (
+        _bindery.enabled
+        and _storyteller.collections_enabled
+        and STORYTELLER_SYNC_COLLECTIONS
+        and STORYTELLER_COLLECTIONS_INTERVAL > 0
+    ):
+        return
+    time.sleep(75)
+    while True:
+        try:
+            series = _bindery.list_all_series()
+            books = _bindery.list_all_books()
+            _storyteller.sync_collections_from_bindery_series(series, books)
+        except Exception:
+            log.exception("Storyteller collections sync failed")
+        time.sleep(STORYTELLER_COLLECTIONS_INTERVAL)
+
+
 def _parse_hhmm(value: str) -> tuple[int, int]:
     hour_s, minute_s = value.strip().split(":", 1)
     hour, minute = int(hour_s), int(minute_s)
@@ -550,6 +577,16 @@ def main() -> None:
         log.info(
             "Bindery audiobook probe enabled (every %ss)",
             int(BINDERY_AUDIO_PROBE_INTERVAL),
+        )
+
+    collections_worker = threading.Thread(
+        target=storyteller_collections_loop, name="storyteller-collections", daemon=True
+    )
+    collections_worker.start()
+    if _bindery.enabled and _storyteller.collections_enabled:
+        log.info(
+            "Storyteller collections from Bindery series enabled (every %ss)",
+            int(STORYTELLER_COLLECTIONS_INTERVAL),
         )
 
     readaloud_worker = threading.Thread(

@@ -163,6 +163,34 @@ class BinderyClient:
                 break
         return items
 
+    def list_all_series(self, page_size: int = 100) -> list[dict[str, Any]]:
+        """Page through Bindery series, including nested membership books."""
+        items: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            qs = urllib.parse.urlencode(
+                {"limit": str(page_size), "offset": str(offset)}
+            )
+            page = self._request("GET", f"/series?{qs}", timeout=120)
+            batch: list[dict[str, Any]] = []
+            total = 0
+            if isinstance(page, dict):
+                raw = page.get("items") or page.get("series") or []
+                batch = raw if isinstance(raw, list) else []
+                total = int(page.get("total") or 0)
+            elif isinstance(page, list):
+                batch = page
+                total = offset + len(batch)
+            if not batch:
+                break
+            items.extend(s for s in batch if isinstance(s, dict))
+            offset += len(batch)
+            if total and offset >= total:
+                break
+            if len(batch) < page_size:
+                break
+        return items
+
     def list_wanted(self) -> list[dict[str, Any]]:
         """Return Wanted/missing books (Bindery GET /wanted/missing)."""
         payload = self._request("GET", "/wanted/missing", timeout=120)

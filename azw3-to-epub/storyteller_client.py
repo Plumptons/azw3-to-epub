@@ -747,12 +747,67 @@ class StorytellerClient:
             return False
         return not bool(media.get("missing"))
 
+    _READALOUD_BUSY = frozenset(
+        {
+            "PROCESSING",
+            "QUEUED",
+            "RUNNING",
+            "TRANSCRIBING",
+            "ALIGNING",
+            "STARTED",
+        }
+    )
+
     def start_processing(self, book_uuid: str, restart: str | None = None) -> None:
         """POST /api/v2/books/{uuid}/process — queue readaloud alignment."""
         path = f"/api/v2/books/{book_uuid}/process"
         if restart:
             path = f"{path}?restart={urllib.parse.quote(restart)}"
         self._request("POST", path, timeout=60)
+
+    def stop_processing(self, book_uuid: str) -> None:
+        """Cancel an in-flight readaloud via DELETE /api/v2/books/{uuid}/process."""
+        self._request("DELETE", f"/api/v2/books/{book_uuid}/process", timeout=60)
+
+    @classmethod
+    def _readaloud_busy(cls, book: dict[str, Any]) -> bool:
+        readaloud = book.get("readaloud") or {}
+        if not isinstance(readaloud, dict):
+            return False
+        if readaloud.get("isProcessing"):
+            return True
+        status = str(readaloud.get("status") or "").upper()
+        return status in cls._READALOUD_BUSY
+
+    def processing_readalouds(
+        self, books: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        books = books if books is not None else self.list_books()
+        return [book for book in books if self._readaloud_busy(book)]
+
+    def stop_active_readalouds(self) -> int:
+        """Cancel queued/running readaloud jobs (used outside the night window)."""
+        if not self.readaloud_enabled:
+            return 0
+        stopped = 0
+        for book in self.processing_readalouds():
+            uuid = book.get("uuid")
+            title = book.get("title") or uuid
+            if not uuid:
+                continue
+            try:
+                self.stop_processing(str(uuid))
+                stopped += 1
+                log.info("Stopped Storyteller readaloud for %s (%s)", title, uuid)
+            except Exception:
+                log.exception(
+                    "Failed stopping Storyteller readaloud for %s (%s)",
+                    title,
+                    uuid,
+                )
+        if stopped:
+            log.info("Storyteller readaloud stopped %s in-flight book(s)", stopped)
+        return stopped
 
     def find_readaloud_candidates(
         self, books: list[dict[str, Any]] | None = None
@@ -770,13 +825,15 @@ class StorytellerClient:
                 candidates.append(book)
                 continue
             status = str(readaloud.get("status") or "").upper()
-            # Already done or actively working — leave alone.
-            if status in {"ALIGNED", "PROCESSING", "QUEUED", "RUNNING"}:
-                # ALIGNED but file gone → allow a full restart.
-                if status == "ALIGNED" and (
-                    readaloud.get("missing") or not readaloud.get("filepath")
-                ):
-                    candidates.append(book)
+            if self._readaloud_busy(book):
+                continue
+            # ALIGNED but file gone → allow a full restart.
+            if status == "ALIGNED" and (
+                readaloud.get("missing") or not readaloud.get("filepath")
+            ):
+                candidates.append(book)
+                continue
+            if status in {"ALIGNED"}:
                 continue
             # STOPPED / FAILED / etc. → retry.
             if status in {"STOPPED", "FAILED", "ERROR", "CANCELLED", ""}:
@@ -784,22 +841,40 @@ class StorytellerClient:
         return candidates
 
     def start_readalouds(self) -> int:
-        """Queue Storyteller readaloud processing for dual-format books."""
+        """Queue at most one Storyteller readaloud unless a higher limit is set.
+
+        Never enqueue while another book is already processing/queued, so
+        overnight sweeps cannot pile up a daytime transcription backlog.
+        """
         if not self.readaloud_enabled:
             return 0
-        limit = max(1, int(os.environ.get("STORYTELLER_READALOUD_LIMIT", "2")))
-        candidates = self.find_readaloud_candidates()
+        limit = max(1, int(os.environ.get("STORYTELLER_READALOUD_LIMIT", "1")))
+        books = self.list_books()
+        busy = self.processing_readalouds(books)
+        if len(busy) >= limit:
+            titles = ", ".join(
+                str(book.get("title") or book.get("uuid")) for book in busy[:5]
+            )
+            log.info(
+                "Storyteller readaloud: %s already in progress (%s); not queueing more",
+                len(busy),
+                titles,
+            )
+            return 0
+        slots = limit - len(busy)
+        candidates = self.find_readaloud_candidates(books)
         if not candidates:
             log.debug("Storyteller readaloud: no dual-format candidates")
             return 0
 
         log.info(
-            "Storyteller readaloud: %s candidate(s), starting up to %s",
+            "Storyteller readaloud: %s candidate(s), %s in progress, starting up to %s",
             len(candidates),
-            limit,
+            len(busy),
+            slots,
         )
         started = 0
-        for book in candidates[:limit]:
+        for book in candidates[:slots]:
             uuid = book.get("uuid")
             title = book.get("title") or uuid
             if not uuid:

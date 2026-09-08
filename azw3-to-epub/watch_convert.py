@@ -416,6 +416,10 @@ def storyteller_readaloud_loop() -> None:
         try:
             wait = _seconds_until_readaloud_window()
             if wait > 0:
+                try:
+                    _storyteller.stop_active_readalouds()
+                except Exception:
+                    log.exception("Storyteller readaloud daytime stop failed")
                 log.info(
                     "Storyteller readaloud idle until %s–%s window (sleep %ss)",
                     STORYTELLER_READALOUD_START,
@@ -603,7 +607,7 @@ def main() -> None:
             STORYTELLER_READALOUD_START,
             STORYTELLER_READALOUD_END,
             int(STORYTELLER_READALOUD_INTERVAL),
-            os.environ.get("STORYTELLER_READALOUD_LIMIT", "2"),
+            os.environ.get("STORYTELLER_READALOUD_LIMIT", "1"),
         )
 
     if INITIAL_SCAN:

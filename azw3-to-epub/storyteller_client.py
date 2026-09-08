@@ -809,6 +809,89 @@ class StorytellerClient:
             log.info("Storyteller readaloud stopped %s in-flight book(s)", stopped)
         return stopped
 
+    def _primary_series(self, book: dict[str, Any]) -> tuple[str, float | None]:
+        rels = [s for s in (book.get("series") or []) if isinstance(s, dict)]
+        if not rels:
+            return "", None
+        rel = rels[0]
+        name = str(rel.get("name") or "").strip()
+        return name, self._parse_series_position(rel.get("position"))
+
+    def _readaloud_complete(self, book: dict[str, Any]) -> bool:
+        readaloud = book.get("readaloud") or {}
+        if not isinstance(readaloud, dict):
+            return False
+        if str(readaloud.get("status") or "").upper() != "ALIGNED":
+            return False
+        return self._media_present(readaloud)
+
+    def _has_both_formats(self, book: dict[str, Any]) -> bool:
+        return self._media_present(book.get("ebook")) and self._media_present(
+            book.get("audiobook")
+        )
+
+    def order_readaloud_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        books: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep series in reading order: only the next unfinished volume is eligible.
+
+        Later books in the same series wait until earlier dual-format volumes
+        are ALIGNED (or currently processing). Series that already have an
+        aligned book are preferred so a series is finished before a new one
+        starts. Standalones come last, by title.
+        """
+        by_series: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+        series_with_aligned: set[str] = set()
+        for book in books:
+            if not self._has_both_formats(book):
+                continue
+            name, pos = self._primary_series(book)
+            if not name:
+                continue
+            if self._readaloud_complete(book):
+                series_with_aligned.add(name)
+            position = pos if pos is not None else float("inf")
+            by_series.setdefault(name, []).append((position, book))
+
+        blocked: set[str] = set()
+        for name, items in by_series.items():
+            items.sort(
+                key=lambda item: (
+                    item[0],
+                    str(item[1].get("title") or "").lower(),
+                )
+            )
+            waiting = False
+            for _pos, book in items:
+                uuid = str(book.get("uuid") or "")
+                if not uuid:
+                    continue
+                if self._readaloud_complete(book) or self._readaloud_busy(book):
+                    continue
+                if waiting:
+                    blocked.add(uuid)
+                else:
+                    waiting = True
+
+        eligible = [
+            book
+            for book in candidates
+            if str(book.get("uuid") or "") not in blocked
+        ]
+
+        def sort_key(book: dict[str, Any]) -> tuple[int, str, float, str]:
+            name, pos = self._primary_series(book)
+            title = str(book.get("title") or "").lower()
+            position = pos if pos is not None else float("inf")
+            if not name:
+                return (2, "", position, title)
+            group = 0 if name in series_with_aligned else 1
+            return (group, name.lower(), position, title)
+
+        return sorted(eligible, key=sort_key)
+
     def find_readaloud_candidates(
         self, books: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
@@ -816,9 +899,7 @@ class StorytellerClient:
         books = books if books is not None else self.list_books()
         candidates: list[dict[str, Any]] = []
         for book in books:
-            if not self._media_present(book.get("ebook")):
-                continue
-            if not self._media_present(book.get("audiobook")):
+            if not self._has_both_formats(book):
                 continue
             readaloud = book.get("readaloud")
             if not readaloud:
@@ -838,7 +919,7 @@ class StorytellerClient:
             # STOPPED / FAILED / etc. → retry.
             if status in {"STOPPED", "FAILED", "ERROR", "CANCELLED", ""}:
                 candidates.append(book)
-        return candidates
+        return self.order_readaloud_candidates(candidates, books)
 
     def start_readalouds(self) -> int:
         """Queue at most one Storyteller readaloud unless a higher limit is set.
@@ -867,11 +948,23 @@ class StorytellerClient:
             log.debug("Storyteller readaloud: no dual-format candidates")
             return 0
 
+        next_book = candidates[0]
+        series_name, series_pos = self._primary_series(next_book)
+        formatted = self._format_series_position(series_pos)
+        if series_name and formatted:
+            place = f"{series_name} #{formatted}"
+        elif series_name:
+            place = series_name
+        else:
+            place = "standalone"
         log.info(
-            "Storyteller readaloud: %s candidate(s), %s in progress, starting up to %s",
+            "Storyteller readaloud: %s candidate(s), %s in progress, "
+            "starting up to %s (next: %s [%s])",
             len(candidates),
             len(busy),
             slots,
+            next_book.get("title") or next_book.get("uuid"),
+            place,
         )
         started = 0
         for book in candidates[:slots]:

@@ -68,7 +68,14 @@ def _unique_dest(dest_dir: Path, name: str) -> Path:
         n += 1
 
 
-def _unlink(path: Path, reason: str) -> None:
+def _dry_run() -> bool:
+    return _truthy("FOLDER_COALESCE_DRY_RUN", "false")
+
+
+def _unlink(path: Path, reason: str, *, dry_run: bool = False) -> None:
+    if dry_run:
+        log.info("DRY-RUN would remove %s (%s)", path, reason)
+        return
     try:
         path.unlink()
         log.info("Removed %s (%s)", path, reason)
@@ -76,9 +83,12 @@ def _unlink(path: Path, reason: str) -> None:
         log.warning("Could not remove %s", path, exc_info=True)
 
 
-def _remove_if_empty(folder: Path) -> bool:
+def _remove_if_empty(folder: Path, *, dry_run: bool = False) -> bool:
     try:
         if folder.is_dir() and not any(folder.iterdir()):
+            if dry_run:
+                log.info("DRY-RUN would remove empty folder %s", folder)
+                return True
             folder.rmdir()
             return True
     except OSError:
@@ -86,47 +96,61 @@ def _remove_if_empty(folder: Path) -> bool:
     return False
 
 
-def _remove_empty_tree(folder: Path) -> bool:
+def _remove_empty_tree(folder: Path, *, dry_run: bool = False) -> bool:
     if not folder.is_dir():
         return False
     for child in list(folder.iterdir()):
         if child.is_dir():
-            _remove_empty_tree(child)
-    return _remove_if_empty(folder)
+            _remove_empty_tree(child, dry_run=dry_run)
+    return _remove_if_empty(folder, dry_run=dry_run)
 
 
-def _merge_tree(src: Path, dest_dir: Path, dest_has_epub: bool) -> tuple[int, bool]:
+def _merge_tree(
+    src: Path,
+    dest_dir: Path,
+    dest_has_epub: bool,
+    *,
+    dry_run: bool = False,
+) -> tuple[int, bool]:
     """Move unique media from src into dest_dir. Drop duplicate ebooks.
 
     Returns (items_moved, dest_has_epub).
     """
     moved = 0
-    if not src.is_dir() or not dest_dir.is_dir():
+    if not src.is_dir():
+        return 0, dest_has_epub
+    if not dest_dir.is_dir() and not dry_run:
         return 0, dest_has_epub
 
     for child in list(src.iterdir()):
         target = dest_dir / child.name
         if child.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            nested_moved, dest_has_epub = _merge_tree(child, target, dest_has_epub)
+            if not dry_run:
+                target.mkdir(parents=True, exist_ok=True)
+            nested_moved, dest_has_epub = _merge_tree(
+                child, target, dest_has_epub, dry_run=dry_run
+            )
             moved += nested_moved
-            _remove_empty_tree(child)
+            _remove_empty_tree(child, dry_run=dry_run)
             continue
 
         if _is_ebook_file(child) and dest_has_epub:
             reason = "duplicate ebook; primary already has EPUB"
             if target.exists() and _same_size(child, target):
                 reason = "identical ebook already in primary"
-            _unlink(child, reason)
+            _unlink(child, reason, dry_run=dry_run)
             continue
 
         if target.exists():
             if _same_size(child, target):
-                _unlink(child, "identical file already in primary")
+                _unlink(child, "identical file already in primary", dry_run=dry_run)
                 continue
             target = _unique_dest(dest_dir, child.name)
 
-        shutil.move(str(child), str(target))
+        if dry_run:
+            log.info("DRY-RUN would move %s -> %s", child, target)
+        else:
+            shutil.move(str(child), str(target))
         moved += 1
         if target.suffix.lower() == ".epub":
             dest_has_epub = True
@@ -177,8 +201,14 @@ def _preferred_dest(primary: Path | None, splits: list[Path]) -> Path:
     return splits[0]
 
 
-def coalesce_group(primary: Path | None, splits: list[Path]) -> bool:
+def coalesce_group(
+    primary: Path | None,
+    splits: list[Path],
+    *,
+    dry_run: bool | None = None,
+) -> bool:
     """Merge all ``(N)`` siblings into the primary title folder."""
+    dry = _dry_run() if dry_run is None else dry_run
     splits = [path for path in splits if path.is_dir()]
     if not splits:
         return False
@@ -195,14 +225,15 @@ def coalesce_group(primary: Path | None, splits: list[Path]) -> bool:
         if not src.is_dir() or src == dest:
             continue
         if not any(src.iterdir()):
-            if _remove_if_empty(src):
+            if _remove_if_empty(src, dry_run=dry):
                 changed = True
             continue
-        moved, dest_has_epub = _merge_tree(src, dest, dest_has_epub)
-        removed = _remove_empty_tree(src)
+        moved, dest_has_epub = _merge_tree(src, dest, dest_has_epub, dry_run=dry)
+        removed = _remove_empty_tree(src, dry_run=dry)
         if moved or removed:
             log.info(
-                "Coalesced %s into %s (moved=%s removed_empty=%s)",
+                "%sCoalesced %s into %s (moved=%s removed_empty=%s)",
+                "DRY-RUN would have: " if dry else "",
                 src,
                 dest,
                 moved,
@@ -216,8 +247,11 @@ def coalesce_group(primary: Path | None, splits: list[Path]) -> bool:
         if match:
             target = dest.with_name(match.group("base"))
             if not target.exists():
-                dest.rename(target)
-                log.info("Renamed orphan split folder to %s", target)
+                if dry:
+                    log.info("DRY-RUN would rename orphan split folder to %s", target)
+                else:
+                    dest.rename(target)
+                    log.info("Renamed orphan split folder to %s", target)
                 changed = True
     elif (
         primary is not None
@@ -225,32 +259,44 @@ def coalesce_group(primary: Path | None, splits: list[Path]) -> bool:
         and dest.is_dir()
         and not primary.exists()
     ):
-        dest.rename(primary)
-        log.info("Renamed coalesced folder to %s", primary)
+        if dry:
+            log.info("DRY-RUN would rename coalesced folder to %s", primary)
+        else:
+            dest.rename(primary)
+            log.info("Renamed coalesced folder to %s", primary)
         changed = True
 
     return changed
 
 
-def coalesce_pair(primary: Path, split: Path) -> bool:
+def coalesce_pair(primary: Path, split: Path, *, dry_run: bool | None = None) -> bool:
     """Move split folder contents into primary. Returns True if work was done."""
-    return coalesce_group(primary, [split])
+    return coalesce_group(primary, [split], dry_run=dry_run)
 
 
-def coalesce_library(library_dir: Path | None = None) -> int:
+def coalesce_library(
+    library_dir: Path | None = None,
+    *,
+    dry_run: bool | None = None,
+) -> int:
     """Find and merge all Bindery ``(N)`` sibling folders. Returns groups fixed."""
     if not _truthy("FOLDER_COALESCE", "true"):
         return 0
+    dry = _dry_run() if dry_run is None else dry_run
     root = library_dir or Path(os.environ.get("LIBRARY_DIR", "/books"))
     fixed = 0
     for primary, splits in find_split_groups(root):
         try:
-            if coalesce_group(primary, splits):
+            if coalesce_group(primary, splits, dry_run=dry):
                 fixed += 1
         except Exception:
             log.exception("Failed coalescing %s + %s", primary, splits)
     if fixed:
-        log.info("Folder coalesce fixed %s split group(s)", fixed)
+        log.info(
+            "Folder coalesce %s %s split group(s)",
+            "would fix" if dry else "fixed",
+            fixed,
+        )
     else:
         log.debug("Folder coalesce: no split pairs to merge")
     return fixed

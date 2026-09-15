@@ -1,11 +1,17 @@
-# Drop-in AZW3 → EPUB converter for the media PC that already runs Bindery + Storyteller.
+# Drop-in AZW3 → EPUB converter for the media PC (main compose, not a tools compose).
 #
-# Best: paste this service into the same compose as bindery/storyteller so
-# BINDERY_URL=http://bindery:8787 and STORYTELLER_URL=http://storyteller:8001 resolve.
+# Best: paste compose.snippet.yml into the same stack as bindery/storyteller/
+# readarrbookshelf so Docker DNS resolves:
+#   BINDERY_URL=http://bindery:8787
+#   STORYTELLER_URL=http://storyteller:8001
 #
-# Paths mirror your Bindery service:
+# Paths mirror Bindery:
 #   BINDERY_LIBRARY_DIR=/media/books
 #   volumes: M:/media:/media
+#
+# Safety: DELETE_SOURCE defaults false; queue clear never passes deleteFiles;
+# FOLDER_COALESCE_DRY_RUN=true logs coalesce work without filesystem changes.
+# See README.md for the full dry-run / never-delete contracts.
 #
 # Tip: point Storyteller's auto-import folder at /media/books so new ebook+audio
 # pairs in the same Bindery folder are matched on import (API merge covers orphans).
@@ -43,6 +49,7 @@ services:
       BINDERY_AUDIO_PROBE_COOLDOWN: ${BINDERY_AUDIO_PROBE_COOLDOWN:-604800}
       FOLDER_COALESCE: ${FOLDER_COALESCE:-true}
       FOLDER_COALESCE_INTERVAL: ${FOLDER_COALESCE_INTERVAL:-300}
+      FOLDER_COALESCE_DRY_RUN: ${FOLDER_COALESCE_DRY_RUN:-false}
       STORYTELLER_URL: ${STORYTELLER_URL:-http://storyteller:8001}
       STORYTELLER_USERNAME: ${STORYTELLER_USERNAME:-}
       STORYTELLER_PASSWORD: ${STORYTELLER_PASSWORD:-}

@@ -1,13 +1,24 @@
-# Paste this service into your media-PC compose (same stack as bindery/storyteller).
+# Paste this service into your media-PC MAIN compose (same stack as
+# bindery / storyteller / readarrbookshelf — not a separate tools compose).
 # Pulls the prebuilt image from GHCR — no local git clone/build required.
 #
 # First pull (if the package is private):
 #   echo YOUR_GITHUB_PAT | docker login ghcr.io -u Plumptons --password-stdin
 #
-# Put secrets in that folder's .env:
-#   BINDERY_API_KEY=...
-#   STORYTELLER_USERNAME=...
-#   STORYTELLER_PASSWORD=...
+# Put secrets in that folder's .env (placeholders only in git):
+#   BINDERY_API_KEY=
+#   STORYTELLER_USERNAME=
+#   STORYTELLER_PASSWORD=
+# Also for the Storyteller service itself (rotate if ever pasted live):
+#   STORYTELLER_SECRET_KEY=
+#
+# Reachability: Docker DNS hostnames on this compose network
+# (http://bindery:8787, http://storyteller:8001) — not LAN/M:-only.
+# Books: Bindery and ReadarrBookshelf both remain; this tool is Bindery-facing
+# for ebook-link hygiene and must stay dual-compatible with the stack.
+#
+# Safety: DELETE_SOURCE stays false. Queue clear never passes deleteFiles.
+# Set FOLDER_COALESCE_DRY_RUN=true for a no-write coalesce report.
 
   azw3-to-epub:
     image: ghcr.io/plumptons/azw3-to-epub:latest
@@ -33,6 +44,7 @@
       BINDERY_AUDIO_PROBE_LIMIT: "5"
       FOLDER_COALESCE: "true"
       FOLDER_COALESCE_INTERVAL: "300"
+      FOLDER_COALESCE_DRY_RUN: ${FOLDER_COALESCE_DRY_RUN:-false}
       STORYTELLER_URL: http://storyteller:8001
       STORYTELLER_USERNAME: ${STORYTELLER_USERNAME}
       STORYTELLER_PASSWORD: ${STORYTELLER_PASSWORD}

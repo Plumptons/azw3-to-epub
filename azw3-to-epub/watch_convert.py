@@ -514,7 +514,8 @@ def main() -> None:
 
     log.info(
         "Watching %s (recursive=%s delete_source=%s initial_scan=%s "
-        "bindery_sync=%s storyteller_merge=%s folder_coalesce=%s)",
+        "bindery_sync=%s storyteller_merge=%s folder_coalesce=%s "
+        "folder_coalesce_dry_run=%s)",
         LIBRARY_DIR,
         RECURSIVE,
         DELETE_SOURCE,
@@ -522,7 +523,14 @@ def main() -> None:
         _bindery.enabled,
         _storyteller.enabled,
         FOLDER_COALESCE,
+        os.environ.get("FOLDER_COALESCE_DRY_RUN", "false").lower()
+        in {"1", "true", "yes"},
     )
+    if DELETE_SOURCE:
+        log.warning(
+            "DELETE_SOURCE=true — AZW3 sources may be removed after convert "
+            "when Bindery does not already handle removal"
+        )
     if _bindery.enabled:
         log.info("Bindery API: %s", _bindery.base_url)
         fixed = _bindery.cleanup_all_parked_epubs()

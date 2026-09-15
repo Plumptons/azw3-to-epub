@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Check whether Bindery ebook/audiobook paths exist on the library disk.
 
-Pass --fix to unlink catalogue paths that are missing on disk.
+Default is report-only (dry-run). Pass --fix to unlink catalogue paths that
+are missing on disk.
+
 Never deletes a library file: only Bindery metadata, and only when the
-mapped path is not an existing file.
+mapped path is not an existing file (API always uses deleteFiles=false).
 """
 
 from __future__ import annotations
@@ -38,12 +40,24 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-BINDERY_BASE = os.environ.get("BINDERY_URL", "http://192.168.0.48:8788").rstrip("/")
+# Prefer Docker DNS when running on the media PC; set BINDERY_URL for off-box.
+BINDERY_BASE = os.environ.get("BINDERY_URL", "http://bindery:8787").rstrip("/")
 BINDERY_KEY = os.environ.get("BINDERY_API_KEY", "").strip()
 BINDERY_ROOT = os.environ.get("BINDERY_LIBRARY_DIR", "/media/books").replace("\\", "/").rstrip("/")
-LIBRARY_DIR = Path(os.environ.get("LIBRARY_DIR", r"M:\books"))
+LIBRARY_DIR = Path(os.environ.get("LIBRARY_DIR", r"M:\media\books"))
 AUDIO_SUFFIXES = {".m4b", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".wav"}
 EBOOK_SUFFIXES = {".epub", ".azw3", ".azw", ".mobi", ".pdf", ".kepub"}
+
+
+def usage() -> None:
+    print(
+        "Usage: check_bindery_files_on_disk.py [--fix]\n"
+        "  (default) report missing Bindery catalogue paths vs disk\n"
+        "  --fix    unlink missing catalogue links only (deleteFiles=false;\n"
+        "           never deletes library files)\n"
+        "Env: BINDERY_URL BINDERY_API_KEY LIBRARY_DIR BINDERY_LIBRARY_DIR",
+        file=sys.stderr,
+    )
 
 
 def get(path: str):
@@ -154,15 +168,23 @@ def disk_ok(local: Path, kind: str) -> bool:
 
 
 def main() -> None:
+    if "--help" in sys.argv or "-h" in sys.argv:
+        usage()
+        return
     fix = "--fix" in sys.argv
     if not BINDERY_KEY:
         print("Set BINDERY_API_KEY", file=sys.stderr)
+        usage()
         sys.exit(1)
     if not LIBRARY_DIR.is_dir():
         print(f"LIBRARY_DIR missing: {LIBRARY_DIR}", file=sys.stderr)
         sys.exit(1)
     books = list_all_books()
-    print(f"Bindery books={len(books)} library={LIBRARY_DIR} fix={fix}", flush=True)
+    mode = "fix" if fix else "report-only (dry-run)"
+    print(
+        f"Bindery books={len(books)} library={LIBRARY_DIR} mode={mode}",
+        flush=True,
+    )
 
     missing: list[str] = []
     to_clear: list[tuple[int, str, str, Path]] = []
@@ -218,6 +240,11 @@ def main() -> None:
         print(line)
 
     if not fix:
+        print(
+            "\nReport only. Re-run with --fix to unlink missing catalogue "
+            "paths (never deletes library files).",
+            flush=True,
+        )
         return
 
     print("\n--- unlink missing Bindery paths (deleteFiles=false) ---", flush=True)

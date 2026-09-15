@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""One-off: assign Storyteller series from Bindery series."""
+"""One-off: assign Storyteller series from Bindery series.
+
+Requires env (or .env): BINDERY_API_KEY, STORYTELLER_USERNAME, STORYTELLER_PASSWORD.
+Optional: BINDERY_URL / STORYTELLER_URL (Docker DNS defaults for on-box runs).
+"""
 
 from __future__ import annotations
 
@@ -38,26 +42,28 @@ from storyteller_client import StorytellerClient  # noqa: E402
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    os.environ.setdefault(
-        "BINDERY_URL",
-        sys.argv[1] if len(sys.argv) > 1 else "http://192.168.0.48:8788",
-    )
-    os.environ.setdefault(
-        "STORYTELLER_URL",
-        sys.argv[2] if len(sys.argv) > 2 else "http://192.168.0.48:8886",
-    )
-    os.environ.setdefault(
-        "STORYTELLER_USERNAME",
-        sys.argv[3] if len(sys.argv) > 3 else "admin",
-    )
-    os.environ.setdefault(
-        "STORYTELLER_PASSWORD",
-        sys.argv[4] if len(sys.argv) > 4 else "adminadmin",
-    )
+    # Optional positional overrides for off-box one-shots; no password defaults.
+    if len(sys.argv) > 1:
+        os.environ["BINDERY_URL"] = sys.argv[1]
+    if len(sys.argv) > 2:
+        os.environ["STORYTELLER_URL"] = sys.argv[2]
+    if len(sys.argv) > 3:
+        os.environ["STORYTELLER_USERNAME"] = sys.argv[3]
+    if len(sys.argv) > 4:
+        os.environ["STORYTELLER_PASSWORD"] = sys.argv[4]
+
+    os.environ.setdefault("BINDERY_URL", "http://bindery:8787")
+    os.environ.setdefault("STORYTELLER_URL", "http://storyteller:8001")
     os.environ.setdefault("BINDERY_SYNC", "true")
     os.environ["STORYTELLER_SYNC_SERIES"] = "true"
+
     if not os.environ.get("BINDERY_API_KEY"):
         print("Set BINDERY_API_KEY", file=sys.stderr)
+        sys.exit(1)
+    if not os.environ.get("STORYTELLER_USERNAME") or not os.environ.get(
+        "STORYTELLER_PASSWORD"
+    ):
+        print("Set STORYTELLER_USERNAME and STORYTELLER_PASSWORD", file=sys.stderr)
         sys.exit(1)
 
     bindery = BinderyClient()

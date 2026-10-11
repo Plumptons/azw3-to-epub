@@ -75,6 +75,16 @@ STORYTELLER_SERIES_INTERVAL = float(
         os.environ.get("STORYTELLER_COLLECTIONS_INTERVAL", "3600"),
     )
 )
+# Bindery descriptions -> Storyteller book blurbs
+STORYTELLER_SYNC_DESCRIPTIONS = os.environ.get(
+    "STORYTELLER_SYNC_DESCRIPTIONS", "true"
+).lower() in {"1", "true", "yes"}
+STORYTELLER_DESCRIPTIONS_INTERVAL = float(
+    os.environ.get(
+        "STORYTELLER_DESCRIPTIONS_INTERVAL",
+        str(STORYTELLER_SERIES_INTERVAL),
+    )
+)
 # Merge Bindery "Title (Year) (2)" sibling folders into the primary title folder
 FOLDER_COALESCE = os.environ.get("FOLDER_COALESCE", "true").lower() in {
     "1",
@@ -364,6 +374,25 @@ def storyteller_series_loop() -> None:
         time.sleep(STORYTELLER_SERIES_INTERVAL)
 
 
+def storyteller_descriptions_loop() -> None:
+    """Copy Bindery descriptions onto matched Storyteller books."""
+    if not (
+        _bindery.enabled
+        and _storyteller.descriptions_enabled
+        and STORYTELLER_SYNC_DESCRIPTIONS
+        and STORYTELLER_DESCRIPTIONS_INTERVAL > 0
+    ):
+        return
+    time.sleep(90)
+    while True:
+        try:
+            books = _bindery.list_all_books()
+            _storyteller.sync_descriptions_from_bindery(books)
+        except Exception:
+            log.exception("Storyteller description sync failed")
+        time.sleep(STORYTELLER_DESCRIPTIONS_INTERVAL)
+
+
 def _parse_hhmm(value: str) -> tuple[int, int]:
     hour_s, minute_s = value.strip().split(":", 1)
     hour, minute = int(hour_s), int(minute_s)
@@ -603,6 +632,18 @@ def main() -> None:
         log.info(
             "Storyteller series from Bindery enabled (every %ss)",
             int(STORYTELLER_SERIES_INTERVAL),
+        )
+
+    descriptions_worker = threading.Thread(
+        target=storyteller_descriptions_loop,
+        name="storyteller-descriptions",
+        daemon=True,
+    )
+    descriptions_worker.start()
+    if _bindery.enabled and _storyteller.descriptions_enabled:
+        log.info(
+            "Storyteller descriptions from Bindery enabled (every %ss)",
+            int(STORYTELLER_DESCRIPTIONS_INTERVAL),
         )
 
     readaloud_worker = threading.Thread(

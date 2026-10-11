@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -106,6 +107,9 @@ class StorytellerClient:
             "STORYTELLER_SYNC_SERIES",
             os.environ.get("STORYTELLER_SYNC_COLLECTIONS", "true"),
         )
+        self.descriptions_enabled = self.configured and _truthy(
+            "STORYTELLER_SYNC_DESCRIPTIONS", "true"
+        )
         self._token: str | None = None
         self._user_id: str | None = None
         self._token_at = 0.0
@@ -200,6 +204,36 @@ class StorytellerClient:
             return [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
         return []
 
+    def update_book(
+        self, book_uuid: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update book metadata via multipart PUT.
+
+        Storyteller's UI JSON-encodes every field value (strings become
+        quoted JSON in the form body). Raw unquoted strings return HTTP 500.
+        """
+        if not fields:
+            return {}
+        boundary = "----stboundary7MA4YWxkTrZu0gW"
+        parts: list[bytes] = [
+            f"--{boundary}\r\n".encode(),
+            b'Content-Disposition: form-data; name="fields"\r\n\r\n',
+            b"uuid\r\n",
+        ]
+        for name in fields:
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(b'Content-Disposition: form-data; name="fields"\r\n\r\n')
+            parts.append(f"{name}\r\n".encode())
+        for name, value in fields.items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+            )
+            parts.append(json.dumps(value).encode("utf-8"))
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return self._put_multipart(book_uuid, boundary, b"".join(parts))
+
     def update_book_series(
         self, book_uuid: str, series: list[dict[str, Any]]
     ) -> dict[str, Any]:
@@ -219,6 +253,11 @@ class StorytellerClient:
             parts.append(json.dumps(item).encode("utf-8"))
             parts.append(b"\r\n")
         parts.append(f"--{boundary}--\r\n".encode())
+        return self._put_multipart(book_uuid, boundary, b"".join(parts))
+
+    def _put_multipart(
+        self, book_uuid: str, boundary: str, body: bytes
+    ) -> dict[str, Any]:
         url = f"{self.base_url}/api/v2/books/{book_uuid}"
         headers = {
             "Accept": "application/json",
@@ -227,9 +266,7 @@ class StorytellerClient:
         token = self._ensure_token()
         headers["Cookie"] = f"st_token={token}"
         headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(
-            url, data=b"".join(parts), headers=headers, method="PUT"
-        )
+        req = urllib.request.Request(url, data=body, headers=headers, method="PUT")
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read()
@@ -317,18 +354,70 @@ class StorytellerClient:
                 names[aid] = str(label)
         return names
 
+    @staticmethod
+    def _library_rel_keys(path: str) -> set[str]:
+        """Relative library keys for matching Bindery ↔ Storyteller filepaths."""
+        text = path.replace("\\", "/").strip().lower()
+        if not text:
+            return set()
+        for marker in ("/books/", "/media/books/"):
+            if marker in text:
+                text = text.split(marker, 1)[1]
+                break
+        text = text.lstrip("/")
+        if not text:
+            return set()
+        keys = {text}
+        # File paths also key by their book folder so ebook/audiobook pairs meet.
+        # Do not key by author folder — that collides every title under one author.
+        name = text.rsplit("/", 1)[-1]
+        if "/" in text and "." in name:
+            keys.add(text.rsplit("/", 1)[0])
+        return keys
+
+    @classmethod
+    def _bindery_path_keys(cls, book: dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+        for field in ("ebookFilePath", "audiobookFilePath", "filePath"):
+            keys |= cls._library_rel_keys(str(book.get(field) or ""))
+        for entry in book.get("bookFiles") or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                keys |= cls._library_rel_keys(str(entry["path"]))
+        return keys
+
+    @classmethod
+    def _storyteller_path_keys(cls, book: dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+        for media_key in ("ebook", "audiobook", "readaloud"):
+            media = book.get(media_key)
+            if isinstance(media, dict) and media.get("filepath"):
+                keys |= cls._library_rel_keys(str(media["filepath"]))
+        return keys
+
     @classmethod
     def _bindery_member_as_book(
-        cls, member: dict[str, Any], authors_by_id: dict[int, str]
+        cls,
+        member: dict[str, Any],
+        authors_by_id: dict[int, str],
+        books_by_id: dict[int, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         nested = member.get("book") if isinstance(member.get("book"), dict) else member
         if not isinstance(nested, dict):
             return None
-        title = str(nested.get("title") or "").strip()
+        book_id = nested.get("id") or member.get("bookId") or member.get("id")
+        full: dict[str, Any] | None = None
+        if books_by_id is not None and book_id is not None:
+            try:
+                full = books_by_id.get(int(book_id))
+            except (TypeError, ValueError):
+                full = None
+        # Prefer list-payload paths from full book; keep member title/position.
+        path_src = full or nested
+        title = str(nested.get("title") or (full or {}).get("title") or "").strip()
         if not title:
             return None
         authors: list[dict[str, str]] = []
-        author = nested.get("author")
+        author = nested.get("author") or (full or {}).get("author")
         if isinstance(author, dict) and (author.get("authorName") or author.get("name")):
             authors.append(
                 {"name": str(author.get("authorName") or author.get("name"))}
@@ -336,16 +425,25 @@ class StorytellerClient:
         elif isinstance(author, str) and author.strip():
             authors.append({"name": author})
         aid = nested.get("authorId")
+        if aid is None and full is not None:
+            aid = full.get("authorId")
         if not authors and isinstance(aid, int) and aid in authors_by_id:
             authors.append({"name": authors_by_id[aid]})
         position = member.get("positionInSeries")
         if position is None:
             position = nested.get("positionInSeries")
-        return {
+        result = {
             "title": title,
             "authors": authors,
             "positionInSeries": position,
+            "ebookFilePath": path_src.get("ebookFilePath") or "",
+            "audiobookFilePath": path_src.get("audiobookFilePath") or "",
+            "filePath": path_src.get("filePath") or "",
+            "bookFiles": path_src.get("bookFiles") or [],
         }
+        if book_id is not None:
+            result["id"] = book_id
+        return result
 
     @staticmethod
     def _parse_series_position(raw: Any) -> float | None:
@@ -377,8 +475,34 @@ class StorytellerClient:
         return value
 
     def _match_storyteller_book(
-        self, bindery_book: dict[str, Any], storyteller_books: list[dict[str, Any]]
+        self,
+        bindery_book: dict[str, Any],
+        storyteller_books: list[dict[str, Any]],
+        st_by_path: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any] | None:
+        # Prefer filepath identity — titles drift after disk rescans.
+        if st_by_path is not None:
+            path_hits: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for key in self._bindery_path_keys(bindery_book):
+                for book in st_by_path.get(key, []):
+                    uuid = str(book.get("uuid") or "")
+                    if not uuid or uuid in seen:
+                        continue
+                    seen.add(uuid)
+                    path_hits.append(book)
+            if len(path_hits) == 1:
+                return path_hits[0]
+            if len(path_hits) > 1:
+                title = str(bindery_book.get("title") or "")
+                titled = [
+                    book
+                    for book in path_hits
+                    if titles_match(title, str(book.get("title") or ""))
+                ]
+                if len(titled) == 1:
+                    return titled[0]
+
         title = str(bindery_book.get("title") or "")
         matches = [
             book
@@ -396,8 +520,13 @@ class StorytellerClient:
         key = self._collection_name_key(name)
         if key in existing:
             return existing[key]
+        # Exact normalized equality only — titles_match substring logic would
+        # collapse "… Ex" / "… (Light Novel)" into the parent series name.
+        want = normalize_title(name)
+        if not want:
+            return None
         for series in existing.values():
-            if titles_match(name, str(series.get("name") or "")):
+            if normalize_title(str(series.get("name") or "")) == want:
                 return series
         return None
 
@@ -443,6 +572,15 @@ class StorytellerClient:
             if s.get("name") and s.get("uuid")
         }
         authors_by_id = self._bindery_authors_by_id(bindery_books or [])
+        books_by_id = {
+            int(b["id"]): b
+            for b in (bindery_books or [])
+            if b.get("id") is not None
+        }
+        st_by_path: dict[str, list[dict[str, Any]]] = {}
+        for book in storyteller_books:
+            for key in self._storyteller_path_keys(book):
+                st_by_path.setdefault(key, []).append(book)
 
         series_matches: list[tuple[str, int, list[tuple[str, float | None]]]] = []
         for series in series_list:
@@ -457,10 +595,14 @@ class StorytellerClient:
             for member in members:
                 if not isinstance(member, dict):
                     continue
-                bindery_book = self._bindery_member_as_book(member, authors_by_id)
+                bindery_book = self._bindery_member_as_book(
+                    member, authors_by_id, books_by_id
+                )
                 if not bindery_book:
                     continue
-                st_book = self._match_storyteller_book(bindery_book, storyteller_books)
+                st_book = self._match_storyteller_book(
+                    bindery_book, storyteller_books, st_by_path
+                )
                 uuid = str((st_book or {}).get("uuid") or "")
                 if not uuid or uuid in seen:
                     continue
@@ -566,6 +708,154 @@ class StorytellerClient:
         bindery_books: list[dict[str, Any]] | None = None,
     ) -> int:
         return self.sync_series_from_bindery(series_list, bindery_books)
+
+    @staticmethod
+    def description_html(text: str) -> str:
+        """Normalize Bindery plain/HTML descriptions for Storyteller's rich text field."""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        # Already markup (Storyteller UI stores <p>…</p>)
+        if re.search(r"<\s*[a-zA-Z][^>]*>", raw):
+            return raw
+        parts = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
+        if not parts:
+            parts = [raw]
+        blocks: list[str] = []
+        for part in parts:
+            escaped = html.escape(part)
+            escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+            escaped = escaped.replace("\n", "<br/>")
+            blocks.append(f"<p>{escaped}</p>")
+        return "".join(blocks)
+
+    @staticmethod
+    def _description_compare_key(text: str) -> str:
+        plain = re.sub(r"<[^>]+>", " ", text or "")
+        plain = html.unescape(plain)
+        return re.sub(r"\s+", " ", plain).strip().casefold()
+
+    @classmethod
+    def _exact_file_path_keys(cls, book: dict[str, Any], *, bindery: bool) -> set[str]:
+        """Filepath keys only (no folder fall-through) for 1:1 Bindery↔ST matching."""
+        keys: set[str] = set()
+        if bindery:
+            raw_paths = [
+                book.get("ebookFilePath"),
+                book.get("audiobookFilePath"),
+                book.get("filePath"),
+            ]
+            for entry in book.get("bookFiles") or []:
+                if isinstance(entry, dict) and entry.get("path"):
+                    raw_paths.append(entry["path"])
+        else:
+            raw_paths = []
+            for media_key in ("ebook", "audiobook", "readaloud"):
+                media = book.get(media_key)
+                if isinstance(media, dict) and media.get("filepath"):
+                    raw_paths.append(media["filepath"])
+        for raw in raw_paths:
+            text = str(raw or "").replace("\\", "/").strip().lower()
+            if not text:
+                continue
+            for marker in ("/books/", "/media/books/"):
+                if marker in text:
+                    text = text.split(marker, 1)[1]
+                    break
+            text = text.lstrip("/")
+            name = text.rsplit("/", 1)[-1]
+            if text and "." in name:
+                keys.add(text)
+        return keys
+
+    def sync_descriptions_from_bindery(
+        self, bindery_books: list[dict[str, Any]]
+    ) -> int:
+        """Copy Bindery book descriptions onto matched Storyteller books.
+
+        Matching uses exact ebook/audiobook filepaths only (no folder
+        fall-through) so sibling titles don't overwrite each other.
+        """
+        if not self.descriptions_enabled:
+            return 0
+        storyteller_books = self.list_books()
+        st_by_file: dict[str, dict[str, Any]] = {}
+        for book in storyteller_books:
+            for key in self._exact_file_path_keys(book, bindery=False):
+                st_by_file.setdefault(key, book)
+
+        updated = 0
+        unmatched = 0
+        ambiguous = 0
+        seen_st: set[str] = set()
+        for bindery_book in bindery_books:
+            bdesc = str(bindery_book.get("description") or "").strip()
+            if not bdesc:
+                continue
+            hits: list[dict[str, Any]] = []
+            hit_ids: set[str] = set()
+            for key in self._exact_file_path_keys(bindery_book, bindery=True):
+                st_book = st_by_file.get(key)
+                if not st_book:
+                    continue
+                uuid = str(st_book.get("uuid") or "")
+                if not uuid or uuid in hit_ids:
+                    continue
+                hit_ids.add(uuid)
+                hits.append(st_book)
+            if not hits:
+                unmatched += 1
+                continue
+            if len(hits) > 1:
+                ambiguous += 1
+                continue
+            st_book = hits[0]
+            uuid = str(st_book["uuid"])
+            if uuid in seen_st:
+                continue
+            html_desc = self.description_html(bdesc)
+            current = str(st_book.get("description") or "")
+            if self._description_compare_key(current) == self._description_compare_key(
+                html_desc
+            ):
+                seen_st.add(uuid)
+                continue
+            try:
+                result = self.update_book(uuid, {"description": html_desc})
+            except Exception:
+                log.exception(
+                    "Storyteller description sync failed for %s",
+                    st_book.get("title") or uuid,
+                )
+                continue
+            if isinstance(result, dict) and result.get("uuid"):
+                st_book["description"] = result.get("description", html_desc)
+            else:
+                st_book["description"] = html_desc
+            seen_st.add(uuid)
+            updated += 1
+            log.info(
+                "Storyteller description: set %s (%s chars)",
+                st_book.get("title") or uuid,
+                len(html_desc),
+            )
+
+        if updated:
+            log.info(
+                "Bindery -> Storyteller descriptions: updated %s book(s), "
+                "unmatched-with-desc %s, ambiguous %s",
+                updated,
+                unmatched,
+                ambiguous,
+            )
+        else:
+            log.debug(
+                "Bindery -> Storyteller descriptions: no changes "
+                "(unmatched-with-desc %s, ambiguous %s)",
+                unmatched,
+                ambiguous,
+            )
+        return updated
 
     @staticmethod
     def author_names(book: dict[str, Any]) -> set[str]:

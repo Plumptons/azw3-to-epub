@@ -13,6 +13,7 @@ Reference complementary tool for Matt’s media PC: watch `/media/books`, conver
 1. Copy secrets into the compose folder’s `.env` (never commit real values):
    - `BINDERY_API_KEY=`
    - `STORYTELLER_USERNAME=` / `STORYTELLER_PASSWORD=`
+   - Optional: `JELLYFIN_API_KEY=` (Dashboard → API Keys) so night readaloud pauses while Jellyfin is playing
    - Also rotate/set `STORYTELLER_SECRET_KEY=` on the **Storyteller** service itself if it was ever pasted in YAML.
 2. Paste [`compose.snippet.yml`](./compose.snippet.yml) into the main stack compose.
 3. `docker compose pull azw3-to-epub && docker compose up -d azw3-to-epub`
@@ -27,10 +28,10 @@ Local/dev: copy [`.env.example`](./.env.example) → `.env`, set `MEDIA_DIR`, th
 |--------|---------|---------------|--------|
 | AZW3 → EPUB convert | on | **Adds** `.epub` beside source | Never overwrites a newer EPUB |
 | `DELETE_SOURCE` | **`false`** | Only if explicitly `true` | Even then, skips delete when Bindery already removed the AZW3 |
-| Bindery queue clear | on | **No library files** | `deleteFiles=false` always |
+| Bindery queue clear | **off** | **No library files** | Opt-in via `BINDERY_CLEAR_QUEUE=true`; `deleteFiles=false` always |
 | Bindery ebook replace | on | May remove AZW3 via Bindery API after EPUB import | Parks EPUB first so sibling sweep cannot kill it |
 | Folder coalesce | on | Moves/merges `Title (N)` siblings | Set `FOLDER_COALESCE_DRY_RUN=true` to log only |
-| Storyteller merge / series / read-along | on | Storyteller API only | Read-along limited to night window |
+| Storyteller merge / series / read-along | on | Storyteller API only | Read-along limited to night window; pauses if Jellyfin is playing (when `JELLYFIN_API_KEY` set) |
 | `scripts/check_bindery_files_on_disk.py` | report | **No** unless `--fix` | `--fix` unlinks **catalogue** paths only (`deleteFiles=false`) |
 
 ### Never delete library files as a “fix”

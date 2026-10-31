@@ -9,6 +9,7 @@
 #   BINDERY_API_KEY=
 #   STORYTELLER_USERNAME=
 #   STORYTELLER_PASSWORD=
+#   JELLYFIN_API_KEY=   (optional — pause readaloud while Jellyfin is playing)
 # Also for the Storyteller service itself (rotate if ever pasted live):
 #   STORYTELLER_SECRET_KEY=
 #
@@ -17,8 +18,8 @@
 # Books: Bindery and ReadarrBookshelf both remain; this tool is Bindery-facing
 # for ebook-link hygiene and must stay dual-compatible with the stack.
 #
-# Safety: DELETE_SOURCE stays false. Queue clear never passes deleteFiles.
-# Set FOLDER_COALESCE_DRY_RUN=true for a no-write coalesce report.
+# Safety: DELETE_SOURCE stays false. Wanted search / queue clear / audio probe
+# are off by default. Set FOLDER_COALESCE_DRY_RUN=true for a no-write coalesce report.
 
   azw3-to-epub:
     image: ghcr.io/plumptons/azw3-to-epub:latest
@@ -35,13 +36,9 @@
       BINDERY_API_KEY: ${BINDERY_API_KEY}
       BINDERY_SYNC: "true"
       BINDERY_LIBRARY_DIR: /media/books
-      BINDERY_WANTED_SEARCH: "true"
-      BINDERY_SEARCH_INTERVAL: "3600"
-      BINDERY_CLEAR_QUEUE: "true"
-      BINDERY_CLEAR_QUEUE_INTERVAL: "300"
-      BINDERY_AUDIO_PROBE: "true"
-      BINDERY_AUDIO_PROBE_INTERVAL: "3600"
-      BINDERY_AUDIO_PROBE_LIMIT: "5"
+      BINDERY_WANTED_SEARCH: "false"
+      BINDERY_CLEAR_QUEUE: "false"
+      BINDERY_AUDIO_PROBE: "false"
       FOLDER_COALESCE: "true"
       FOLDER_COALESCE_INTERVAL: "300"
       FOLDER_COALESCE_DRY_RUN: ${FOLDER_COALESCE_DRY_RUN:-false}
@@ -59,6 +56,10 @@
       STORYTELLER_SERIES_INTERVAL: "3600"
       STORYTELLER_SYNC_DESCRIPTIONS: "true"
       STORYTELLER_DESCRIPTIONS_INTERVAL: "3600"
+      JELLYFIN_URL: ${JELLYFIN_URL:-http://jellyfin:8096}
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      JELLYFIN_PAUSE_READALOUD: ${JELLYFIN_PAUSE_READALOUD:-true}
+      JELLYFIN_PLAYBACK_CHECK_INTERVAL: ${JELLYFIN_PLAYBACK_CHECK_INTERVAL:-60}
       EPUB_VERSION: "3"
     volumes:
       - M:/media:/media

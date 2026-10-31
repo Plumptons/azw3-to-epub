@@ -18,6 +18,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from bindery_client import BinderyClient
+from jellyfin_client import JellyfinClient
 from library_coalesce import coalesce_library
 from storyteller_client import StorytellerClient
 
@@ -39,15 +40,15 @@ STORYTELLER_READALOUD_INTERVAL = float(
 # Local-time window (container TZ) when readaloud jobs may be queued
 STORYTELLER_READALOUD_START = os.environ.get("STORYTELLER_READALOUD_START", "00:01")
 STORYTELLER_READALOUD_END = os.environ.get("STORYTELLER_READALOUD_END", "06:00")
-# How often to ask Bindery to search+grab Wanted books (Bindery's own loop is ~12h)
+# Opt-in: ask Bindery to search+grab Wanted books more often than its ~12h loop
 BINDERY_SEARCH_INTERVAL = float(os.environ.get("BINDERY_SEARCH_INTERVAL", "3600"))
-BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "true").lower() in {
+BINDERY_WANTED_SEARCH = os.environ.get("BINDERY_WANTED_SEARCH", "false").lower() in {
     "1",
     "true",
     "yes",
 }
-# Clear failed/imported Bindery queue rows (never deletes download files)
-BINDERY_CLEAR_QUEUE = os.environ.get("BINDERY_CLEAR_QUEUE", "true").lower() in {
+# Opt-in: clear failed/imported Bindery queue rows (never deletes download files)
+BINDERY_CLEAR_QUEUE = os.environ.get("BINDERY_CLEAR_QUEUE", "false").lower() in {
     "1",
     "true",
     "yes",
@@ -55,8 +56,8 @@ BINDERY_CLEAR_QUEUE = os.environ.get("BINDERY_CLEAR_QUEUE", "true").lower() in {
 BINDERY_CLEAR_QUEUE_INTERVAL = float(
     os.environ.get("BINDERY_CLEAR_QUEUE_INTERVAL", "300")
 )
-# Probe ebook-only books for audiobook releases; keep both or revert to ebook
-BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "true").lower() in {
+# Opt-in: probe ebook-only books for audiobook releases; keep both or revert to ebook
+BINDERY_AUDIO_PROBE = os.environ.get("BINDERY_AUDIO_PROBE", "false").lower() in {
     "1",
     "true",
     "yes",
@@ -111,6 +112,7 @@ _lock = threading.Lock()
 _inflight: set[Path] = set()
 _bindery = BinderyClient()
 _storyteller = StorytellerClient()
+_jellyfin = JellyfinClient()
 
 
 def ebook_convert_bin() -> str:
@@ -432,8 +434,23 @@ def _seconds_until_readaloud_window(now: datetime | None = None) -> float:
     return max(1.0, (target - now).total_seconds())
 
 
+def _log_jellyfin_playback(sessions: list[dict]) -> None:
+    if not sessions:
+        return
+    summary = "; ".join(
+        f'{s.get("user")}@{s.get("device")}: {s.get("title")}'
+        + (" (paused)" if s.get("paused") else "")
+        for s in sessions[:5]
+    )
+    log.info("Jellyfin playback active (%s)", summary)
+
+
 def storyteller_readaloud_loop() -> None:
-    """Queue Storyteller readaloud jobs for dual-format books (night window only)."""
+    """Queue Storyteller readaloud jobs for dual-format books (night window only).
+
+    When Jellyfin is configured, poll sessions often and pause/stop readaloud
+    while anyone is actively playing so GPU/CPU load does not stutter playback.
+    """
     if not (
         _storyteller.readaloud_enabled
         and STORYTELLER_AUTO_READALOUD
@@ -441,6 +458,8 @@ def storyteller_readaloud_loop() -> None:
     ):
         return
     time.sleep(120)
+    last_queue_at = 0.0
+    was_jellyfin_blocked = False
     while True:
         try:
             wait = _seconds_until_readaloud_window()
@@ -457,15 +476,53 @@ def storyteller_readaloud_loop() -> None:
                 )
                 time.sleep(wait)
                 continue
-            # Merge first so ebook-only + audio-only become dual-format candidates.
-            if _storyteller.enabled:
-                _storyteller.merge_all_pairs()
-            _storyteller.start_readalouds()
+
+            jellyfin_playing = False
+            if _jellyfin.enabled:
+                jellyfin_playing, sessions = _jellyfin.is_playing()
+                if jellyfin_playing:
+                    _log_jellyfin_playback(sessions)
+                    try:
+                        stopped = _storyteller.stop_active_readalouds()
+                    except Exception:
+                        log.exception(
+                            "Storyteller readaloud Jellyfin pause stop failed"
+                        )
+                        stopped = 0
+                    if stopped or not was_jellyfin_blocked:
+                        log.info(
+                            "Paused Storyteller readaloud — Jellyfin is playing"
+                            + (f" (stopped {stopped})" if stopped else "")
+                        )
+                    was_jellyfin_blocked = True
+                elif was_jellyfin_blocked:
+                    log.info(
+                        "Jellyfin idle again — Storyteller readaloud may resume"
+                    )
+
+            if not jellyfin_playing:
+                now = time.time()
+                due = (
+                    last_queue_at == 0.0
+                    or was_jellyfin_blocked
+                    or (now - last_queue_at) >= STORYTELLER_READALOUD_INTERVAL
+                )
+                if due:
+                    # Merge first so ebook-only + audio-only become candidates.
+                    if _storyteller.enabled:
+                        _storyteller.merge_all_pairs()
+                    _storyteller.start_readalouds()
+                    last_queue_at = now
+                    was_jellyfin_blocked = False
         except Exception:
             log.exception("Storyteller readaloud sweep failed")
-        # Stay responsive to window end; don't sleep past 06:00.
+
+        # Poll often when Jellyfin gate is on; otherwise keep the old interval.
         if _in_readaloud_window():
-            time.sleep(STORYTELLER_READALOUD_INTERVAL)
+            if _jellyfin.enabled:
+                time.sleep(_jellyfin.check_interval)
+            else:
+                time.sleep(STORYTELLER_READALOUD_INTERVAL)
         else:
             time.sleep(min(60.0, STORYTELLER_READALOUD_INTERVAL))
 
@@ -658,6 +715,18 @@ def main() -> None:
             int(STORYTELLER_READALOUD_INTERVAL),
             os.environ.get("STORYTELLER_READALOUD_LIMIT", "1"),
         )
+        if _jellyfin.enabled:
+            log.info(
+                "Jellyfin playback gate on (%s, check every %ss) — "
+                "readaloud pauses while sessions are playing",
+                _jellyfin.base_url,
+                int(_jellyfin.check_interval),
+            )
+        elif os.environ.get("JELLYFIN_URL", "").strip():
+            log.warning(
+                "JELLYFIN_URL set but playback gate inactive "
+                "(need JELLYFIN_API_KEY and JELLYFIN_PAUSE_READALOUD=true)"
+            )
 
     if INITIAL_SCAN:
         initial_scan()

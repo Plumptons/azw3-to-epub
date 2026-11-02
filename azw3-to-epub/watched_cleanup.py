@@ -227,13 +227,31 @@ class WatchedCleanup:
             log.warning("Watched cleanup: no Jellyfin users matched filter")
             return 0
 
-        # Refresh *arr indexes once per sweep
+        # Refresh *arr indexes once per sweep (isolate failures so one *arr
+        # with a bad key does not abort the other).
+        sonarr_ok = False
+        radarr_ok = False
         if self.sonarr.enabled and "Episode" in self.types:
-            self.sonarr.invalidate()
-            self.sonarr.build_path_index()
+            try:
+                self.sonarr.invalidate()
+                self.sonarr.build_path_index()
+                sonarr_ok = True
+            except Exception:
+                log.exception(
+                    "Watched cleanup: Sonarr index failed — skipping episodes this sweep"
+                )
         if self.radarr.enabled and "Movie" in self.types:
-            self.radarr.invalidate()
-            self.radarr.build_path_index()
+            try:
+                self.radarr.invalidate()
+                self.radarr.build_path_index()
+                radarr_ok = True
+            except Exception:
+                log.exception(
+                    "Watched cleanup: Radarr index failed — skipping movies this sweep"
+                )
+        if not sonarr_ok and not radarr_ok:
+            log.error("Watched cleanup: neither Sonarr nor Radarr indexable")
+            return 0
 
         actions = 0
         for user_id, user_name in users:
@@ -254,6 +272,11 @@ class WatchedCleanup:
                 if not _truthy_item_played(item):
                     continue
                 if not self._grace_ok(item):
+                    continue
+                item_type = str(item.get("Type") or "")
+                if item_type == "Episode" and not sonarr_ok:
+                    continue
+                if item_type == "Movie" and not radarr_ok:
                     continue
                 match = self._match(item)
                 if match is None:

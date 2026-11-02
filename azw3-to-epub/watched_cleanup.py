@@ -65,6 +65,8 @@ class WatchedCleanup:
         self.limit = max(
             1, int(os.environ.get("WATCHED_CLEANUP_ITEM_LIMIT", "200"))
         )
+        # Skip Jellyfin favorites (episode/movie, and parent series for episodes)
+        self.skip_favorites = _truthy("WATCHED_CLEANUP_SKIP_FAVORITES", "true")
         raw_users = os.environ.get(
             "WATCHED_CLEANUP_USER_NAMES",
             os.environ.get("JELLYFIN_USER_NAMES", ""),
@@ -82,6 +84,7 @@ class WatchedCleanup:
         self.radarr = RadarrClient()
         self._processed: set[str] = set()
         self._series_tvdb: dict[str, str] = {}
+        self._series_favorite: dict[str, bool] = {}
         self._load_state()
 
     @property
@@ -130,6 +133,49 @@ class WatchedCleanup:
             return False
         age_h = (datetime.now(timezone.utc) - played.astimezone(timezone.utc)).total_seconds() / 3600.0
         return age_h >= self.grace_hours
+
+    @staticmethod
+    def _is_favorite(item: dict[str, Any]) -> bool:
+        user_data = item.get("UserData") if isinstance(item.get("UserData"), dict) else {}
+        return bool(user_data.get("IsFavorite"))
+
+    def _series_is_favorite(self, user_id: str, item: dict[str, Any]) -> bool:
+        series_id = str(item.get("SeriesId") or "").strip()
+        if not series_id:
+            series = item.get("Series") if isinstance(item.get("Series"), dict) else {}
+            series_id = str(series.get("Id") or "").strip()
+        if not series_id:
+            return False
+        cache_key = f"{user_id}:{series_id}"
+        if cache_key in self._series_favorite:
+            return self._series_favorite[cache_key]
+        try:
+            meta = self.jellyfin.get_user_item(user_id, series_id)
+        except Exception:
+            log.debug(
+                "Could not fetch Jellyfin series favorite state %s",
+                series_id,
+                exc_info=True,
+            )
+            self._series_favorite[cache_key] = False
+            return False
+        favored = bool(meta and self._is_favorite(meta))
+        self._series_favorite[cache_key] = favored
+        return favored
+
+    def _should_skip_favorite(
+        self, user_id: str, item: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """Return (skip, reason). Favorites are never deleted/unmonitored."""
+        if not self.skip_favorites:
+            return False, ""
+        if self._is_favorite(item):
+            return True, "item favorited"
+        if str(item.get("Type") or "") == "Episode" and self._series_is_favorite(
+            user_id, item
+        ):
+            return True, "series favorited"
+        return False, ""
 
     def _series_tvdb_id(self, item: dict[str, Any]) -> str | None:
         series_providers = (
@@ -253,7 +299,9 @@ class WatchedCleanup:
             log.error("Watched cleanup: neither Sonarr nor Radarr indexable")
             return 0
 
+        self._series_favorite.clear()
         actions = 0
+        skipped_fav = 0
         for user_id, user_name in users:
             try:
                 items = self.jellyfin.list_played_items(
@@ -278,6 +326,19 @@ class WatchedCleanup:
                     continue
                 if item_type == "Movie" and not radarr_ok:
                     continue
+                skip_fav, fav_reason = self._should_skip_favorite(user_id, item)
+                if skip_fav:
+                    skipped_fav += 1
+                    title = str(item.get("Name") or jelly_id)
+                    series = str(item.get("SeriesName") or "")
+                    label = f"{series} — {title}" if series else title
+                    log.info(
+                        "Watched cleanup: skip favorite (%s): %s",
+                        fav_reason,
+                        label,
+                    )
+                    # Do not mark processed — unfavorite later can clean up.
+                    continue
                 match = self._match(item)
                 if match is None:
                     title = str(item.get("Name") or jelly_id)
@@ -297,6 +358,11 @@ class WatchedCleanup:
                     log.exception(
                         "Watched cleanup failed for %s", match.title
                     )
+
+        if skipped_fav:
+            log.info(
+                "Watched cleanup: skipped %s favorited item(s)", skipped_fav
+            )
 
         if actions:
             self._save_state()
@@ -328,11 +394,12 @@ def watched_cleanup_loop(jellyfin: JellyfinClient | None = None) -> None:
 
     log.info(
         "Watched cleanup enabled (dry_run=%s interval=%ss grace=%sh types=%s "
-        "sonarr=%s radarr=%s)",
+        "skip_favorites=%s sonarr=%s radarr=%s)",
         cleaner.dry_run,
         int(cleaner.interval),
         cleaner.grace_hours,
         ",".join(cleaner.types),
+        cleaner.skip_favorites,
         bool(cleaner.sonarr.enabled),
         bool(cleaner.radarr.enabled),
     )

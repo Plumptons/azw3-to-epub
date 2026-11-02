@@ -32,7 +32,7 @@ Local/dev: copy [`.env.example`](./.env.example) → `.env`, set `MEDIA_DIR`, th
 | Bindery ebook replace | on | May remove AZW3 via Bindery API after EPUB import | Parks EPUB first so sibling sweep cannot kill it |
 | Folder coalesce | on | Moves/merges `Title (N)` siblings | Set `FOLDER_COALESCE_DRY_RUN=true` to log only |
 | Storyteller merge / series / read-along | on | Storyteller API only | Read-along limited to night window; pauses if Jellyfin is playing (when `JELLYFIN_API_KEY` set) |
-| Watched cleanup (Sonarr/Radarr) | **`false`** | Only if enabled **and** `WATCHED_CLEANUP_DRY_RUN=false` | Deletes **watched episode/movie files** via *arr API and unmonitors that item only (not the series). Requires Jellyfin + Sonarr/Radarr keys. |
+| Watched cleanup (Sonarr/Radarr) | **`false`** | Only if enabled **and** `WATCHED_CLEANUP_DRY_RUN=false` | Deletes **watched episode/movie files** via *arr API and unmonitors that item only (not the series). Skips Jellyfin favorites (item or parent series) when `WATCHED_CLEANUP_SKIP_FAVORITES=true` (default). Requires Jellyfin + Sonarr/Radarr keys. |
 | `scripts/check_bindery_files_on_disk.py` | report | **No** unless `--fix` | `--fix` unlinks **catalogue** paths only (`deleteFiles=false`) |
 
 ### Never delete library files as a “fix”

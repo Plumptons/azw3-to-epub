@@ -149,6 +149,11 @@ class JellyfinClient:
         payload = self._request(f"/Items/{item_id}")
         return payload if isinstance(payload, dict) else None
 
+    def get_user_item(self, user_id: str, item_id: str) -> dict[str, Any] | None:
+        """Item view for a specific user (includes that user's UserData/favorites)."""
+        payload = self._request(f"/Users/{user_id}/Items/{item_id}")
+        return payload if isinstance(payload, dict) else None
+
     def list_played_items(
         self,
         user_id: str,

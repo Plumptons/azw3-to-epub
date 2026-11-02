@@ -10,6 +10,7 @@
 #   STORYTELLER_USERNAME=
 #   STORYTELLER_PASSWORD=
 #   JELLYFIN_API_KEY=   (optional — pause readaloud while Jellyfin is playing)
+#   SONARR_API_KEY= / RADARR_API_KEY=  (optional — watched episode/movie cleanup)
 # Also for the Storyteller service itself (rotate if ever pasted live):
 #   STORYTELLER_SECRET_KEY=
 #
@@ -60,6 +61,16 @@
       JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
       JELLYFIN_PAUSE_READALOUD: ${JELLYFIN_PAUSE_READALOUD:-true}
       JELLYFIN_PLAYBACK_CHECK_INTERVAL: ${JELLYFIN_PLAYBACK_CHECK_INTERVAL:-60}
+      # Opt-in watched cleanup (episode/movie file delete + unmonitor; not whole series)
+      WATCHED_CLEANUP: ${WATCHED_CLEANUP:-false}
+      WATCHED_CLEANUP_DRY_RUN: ${WATCHED_CLEANUP_DRY_RUN:-true}
+      WATCHED_CLEANUP_INTERVAL: ${WATCHED_CLEANUP_INTERVAL:-3600}
+      WATCHED_CLEANUP_GRACE_HOURS: ${WATCHED_CLEANUP_GRACE_HOURS:-24}
+      WATCHED_CLEANUP_TYPES: ${WATCHED_CLEANUP_TYPES:-Episode,Movie}
+      SONARR_URL: ${SONARR_URL:-http://sonarr:8989}
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+      RADARR_URL: ${RADARR_URL:-http://radarr:7878}
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
       EPUB_VERSION: "3"
     volumes:
       - M:/media:/media

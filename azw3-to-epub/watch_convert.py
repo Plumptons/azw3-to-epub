@@ -21,6 +21,7 @@ from bindery_client import BinderyClient
 from jellyfin_client import JellyfinClient
 from library_coalesce import coalesce_library
 from storyteller_client import StorytellerClient
+from watched_cleanup import watched_cleanup_loop
 
 LIBRARY_DIR = Path(os.environ.get("LIBRARY_DIR", "/books"))
 DELETE_SOURCE = os.environ.get("DELETE_SOURCE", "false").lower() in {"1", "true", "yes"}
@@ -701,6 +702,19 @@ def main() -> None:
         log.info(
             "Storyteller descriptions from Bindery enabled (every %ss)",
             int(STORYTELLER_DESCRIPTIONS_INTERVAL),
+        )
+
+    watched_worker = threading.Thread(
+        target=watched_cleanup_loop,
+        kwargs={"jellyfin": _jellyfin},
+        name="watched-cleanup",
+        daemon=True,
+    )
+    watched_worker.start()
+    if os.environ.get("WATCHED_CLEANUP", "false").lower() in {"1", "true", "yes"}:
+        log.info(
+            "Watched cleanup thread started (dry_run=%s)",
+            os.environ.get("WATCHED_CLEANUP_DRY_RUN", "true"),
         )
 
     readaloud_worker = threading.Thread(

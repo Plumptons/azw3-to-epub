@@ -32,6 +32,7 @@ Local/dev: copy [`.env.example`](./.env.example) → `.env`, set `MEDIA_DIR`, th
 | Bindery ebook replace | on | May remove AZW3 via Bindery API after EPUB import | Parks EPUB first so sibling sweep cannot kill it |
 | Folder coalesce | on | Moves/merges `Title (N)` siblings | Set `FOLDER_COALESCE_DRY_RUN=true` to log only |
 | Storyteller merge / series / read-along | on | Storyteller API only | Read-along limited to night window; pauses if Jellyfin is playing (when `JELLYFIN_API_KEY` set) |
+| Watched cleanup (Sonarr/Radarr) | **`false`** | Only if enabled **and** `WATCHED_CLEANUP_DRY_RUN=false` | Deletes **watched episode/movie files** via *arr API and unmonitors that item only (not the series). Requires Jellyfin + Sonarr/Radarr keys. |
 | `scripts/check_bindery_files_on_disk.py` | report | **No** unless `--fix` | `--fix` unlinks **catalogue** paths only (`deleteFiles=false`) |
 
 ### Never delete library files as a “fix”
@@ -40,6 +41,7 @@ Local/dev: copy [`.env.example`](./.env.example) → `.env`, set `MEDIA_DIR`, th
 - Queue row removal must not pass `deleteFiles=true`.
 - Coalesce may remove **duplicate identical** files already present in the primary folder, or empty split folders after a merge — not arbitrary library content.
 - `DELETE_SOURCE=false` stays the production default.
+- `WATCHED_CLEANUP=false` and `WATCHED_CLEANUP_DRY_RUN=true` stay the production defaults. Enable dry-run first and read logs before setting `WATCHED_CLEANUP_DRY_RUN=false`.
 
 ### Dry-run / report modes
 

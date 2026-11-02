@@ -119,3 +119,61 @@ class JellyfinClient:
                 exc_info=True,
             )
             return False, []
+
+    @property
+    def configured(self) -> bool:
+        """True when URL+API key are present (independent of pause-readaloud)."""
+        return bool(self.base_url and self.api_key)
+
+    def list_users(self) -> list[dict[str, Any]]:
+        payload = self._request("/Users")
+        if not isinstance(payload, list):
+            return []
+        return [u for u in payload if isinstance(u, dict)]
+
+    def resolve_user_ids(self, names: set[str] | None = None) -> list[tuple[str, str]]:
+        """Return [(user_id, user_name), ...] filtered by optional name set."""
+        want = {n.lower() for n in (names or set()) if n}
+        out: list[tuple[str, str]] = []
+        for user in self.list_users():
+            uid = str(user.get("Id") or "").strip()
+            name = str(user.get("Name") or "").strip()
+            if not uid:
+                continue
+            if want and name.lower() not in want:
+                continue
+            out.append((uid, name or uid))
+        return out
+
+    def get_item(self, item_id: str) -> dict[str, Any] | None:
+        payload = self._request(f"/Items/{item_id}")
+        return payload if isinstance(payload, dict) else None
+
+    def list_played_items(
+        self,
+        user_id: str,
+        *,
+        include_types: tuple[str, ...] = ("Episode", "Movie"),
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Played Movie/Episode items for a user (Path + ProviderIds + dates)."""
+        types = ",".join(include_types)
+        query = urllib.parse.urlencode(
+            {
+                "IncludeItemTypes": types,
+                "Filters": "IsPlayed",
+                "Recursive": "true",
+                "Fields": "Path,ProviderIds,SeriesName,SeriesId,IndexNumber,ParentIndexNumber,DateCreated,UserData",
+                "SortBy": "DatePlayed",
+                "SortOrder": "Descending",
+                "Limit": str(max(1, limit)),
+            }
+        )
+        payload = self._request(f"/Users/{user_id}/Items?{query}")
+        if isinstance(payload, dict):
+            items = payload.get("Items")
+            if isinstance(items, list):
+                return [i for i in items if isinstance(i, dict)]
+        if isinstance(payload, list):
+            return [i for i in payload if isinstance(i, dict)]
+        return []

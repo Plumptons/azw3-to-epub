@@ -353,7 +353,10 @@ class WatchedCleanup:
                 try:
                     self._apply(match)
                     actions += 1
-                    self._processed.add(state_key)
+                    # Only persist after a real delete/unmonitor. Dry-run must
+                    # not consume the item or enabling live mode later skips it.
+                    if not self.dry_run:
+                        self._processed.add(state_key)
                 except Exception:
                     log.exception(
                         "Watched cleanup failed for %s", match.title
